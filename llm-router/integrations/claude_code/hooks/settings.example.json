@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/llm-router/integrations/claude_code/hooks/post_tool_use.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/llm-router/integrations/claude_code/hooks/task_complete.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "LLM_ROUTER_URL": "http://127.0.0.1:8000",
+    "LLM_ROUTER_SESSION_ID": "",
+    "LLM_ROUTER_TASK_ID": ""
+  }
+}

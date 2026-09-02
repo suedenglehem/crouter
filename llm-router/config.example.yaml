@@ -1,0 +1,89 @@
+# llm-router example configuration.
+# Copy to config.yaml and adjust. See README.md for the full reference.
+
+server:
+  host: "127.0.0.1"      # keep localhost unless you know what you're doing (PRD §39)
+  port: 8000
+
+defaults:
+  route: "auto"          # model used when a request omits "model": auto|fast|deep|frontier
+
+backends:
+  # Tier keys (fast/deep/frontier) are the routing tiers. The `name` is what
+  # clients see as the logical model alias and in /v1/models.
+
+  fast:
+    type: "openai_compatible"     # llama-server :8001 — a plain OpenAI-compatible server
+    name: "local-fast"
+    base_url: "http://127.0.0.1:8001/v1"
+    model: "local-fast"           # the real model name to send to this backend
+    timeout_seconds: 300
+
+  deep:
+    type: "openai_compatible"     # llama-server :8002 (dual GPU)
+    name: "local-deep"
+    base_url: "http://127.0.0.1:8002/v1"
+    model: "local-deep"
+    timeout_seconds: 600
+
+  frontier:
+    type: "openrouter"            # OpenAI-compatible + API key from environment
+    name: "frontier"
+    base_url: "https://openrouter.ai/api/v1"
+    model: "MODEL_NAME"           # e.g. anthropic/claude-sonnet-4 — never hard-coded in code
+    api_key_env: "OPENROUTER_API_KEY"
+    timeout_seconds: 900
+
+routing:
+  default: "fast"                 # tier that `auto` starts on (PRD §10)
+
+  # Backend-fallback policy (PRD §31). A *backend* failure (crash, 5xx,
+  # timeout) is NOT a model-quality failure — it falls back here instead of
+  # escalating. Cloud fallback only happens when cloud.enabled is true.
+  # Omit or leave empty to return an error when a backend is down.
+  fallbacks:
+    fast: []                      # e.g. [deep] if you want deep to absorb fast outages
+
+  escalation:
+    enabled: true
+
+    max_fast_attempts: 2          # rule D: retries on fast before escalating
+    max_deep_attempts: 2          # rule D: retries on deep before escalating
+    failure_threshold: 2          # rules B/C: repeated test/tool failures that escalate
+
+    allow_frontier: true            # automatic escalation may reach the cloud tier
+
+    signals:                      # which deterministic signals are active (PRD §19)
+      explicit_request: true      # rule A: X-LLM-Escalate / explicit_escalation event
+      repeated_tool_failure: true # rule C
+      repeated_test_failure: true # rule B
+      timeout: false              # backend timeouts count as failures when true
+      backend_error: false        # backend 5xx/4xx responses count as failures when true
+
+    chain:                        # escalation order (PRD §11)
+      - fast
+      - deep
+      - frontier
+
+cloud:                            # cost protection for the frontier tier (PRD §21, §22)
+  enabled: true
+  allow_automatic_escalation: false   # recommended for first deployment; flip to true once trusted
+  max_requests_per_hour: 100
+  max_estimated_cost_usd_per_day: 10.0
+  allow_manual_when_limited: true     # explicit X-LLM-Escalate: frontier still works at the limit
+  pricing:                          # optional; used to estimate daily cost from usage tokens
+    input_per_mtok: 3.0             # $ per 1M prompt tokens (set for your OpenRouter model)
+    output_per_mtok: 15.0           # $ per 1M completion tokens
+
+logging:
+  level: "INFO"
+  log_requests: true        # one structured line per request (no prompts)
+  log_responses: false      # response bodies at DEBUG — off by default
+  log_prompts: false        # prompt content at DEBUG — off by default (PRD §32/§39)
+
+metrics:
+  enabled: true             # GET /metrics (Prometheus text format)
+
+health:
+  check_interval_seconds: 10   # backend health results are cached this long
+  timeout_seconds: 2           # per-backend health probe timeout

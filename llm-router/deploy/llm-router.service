@@ -1,0 +1,40 @@
+# Example systemd service for llm-router (PRD 40).
+#
+# Install:
+#   sudo useradd -r -s /usr/sbin/nologin llm-router || true
+#   sudo mkdir -p /etc/llm-router
+#   sudo cp config.yaml /etc/llm-router/config.yaml        # your real config
+#   printf 'OPENROUTER_API_KEY=sk-or-...\n' | sudo tee /etc/llm-router/env
+#   sudo chmod 640 /etc/llm-router/env && sudo chown root:llm-router /etc/llm-router/env
+#   sudo cp llm-router.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now llm-router
+#
+# Logs go to journald:  journalctl -u llm-router -f
+
+[Unit]
+Description=LLM Routing & Escalation Service (llm-router)
+After=network.target
+
+[Service]
+Type=simple
+User=llm-router
+Group=llm-router
+
+# Configuration from a fixed path; CLI flags could be added here too.
+ExecStart=/opt/llm-router/.venv/bin/python -m router --config /etc/llm-router/config.yaml
+
+# OPENROUTER_API_KEY is read from this file (mode 640, root:llm-router),
+# never stored in the YAML config and never logged by the service.
+EnvironmentFile=-/etc/llm-router/env
+
+Restart=on-failure
+RestartSec=2
+
+# Hardening (adjust if your venv layout needs it)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/llm-router
+
+[Install]
+WantedBy=multi-user.target

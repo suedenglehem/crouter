@@ -1,0 +1,205 @@
+# llm-router
+
+A small, reliable **local-first LLM routing & escalation service** for use with Claude Code.
+
+It sits between your agent and three model tiers — a fast local model, a stronger local model, and an optional cloud (OpenRouter) frontier model — and routes each request to the right one:
+
+```text
+                         Claude Code / any OpenAI client
+                              │  OpenAI-compatible API :8000
+                              ▼
+                 ┌──────────────────────────┐
+                 │        llm-router        │
+                 │  Router + Controller     │
+                 │  Session/task state      │
+                 │  Escalation policy       │
+                 │  Health / metrics        │
+                 └────────────┬─────────────┘
+             ┌────────────────┼─────────────────┐
+             ▼                ▼                 ▼
+        LOCAL FAST       LOCAL DEEP        OPENROUTER (frontier)
+        :8001            :8002              HTTPS
+```
+
+Design goals: **simple enough to understand and debug**, deterministic escalation (no LLM judging difficulty), transparent proxying (no prompt rewriting), and hard cloud-cost safeguards. See the PRD, *Local LLM Routing & Escalation System*, for the full specification; this README is the operator's guide.
+
+---
+
+## Tiers
+
+| Tier | Alias | Typical model | Backend |
+|------|-------|---------------|---------|
+| fast | `local-fast` | 12–16B | llama-server :8001 (single GPU) |
+| deep | `local-deep` | ~30–40B | llama-server :8002 (dual GPU) |
+| frontier | `frontier` | any OpenRouter model | https://openrouter.ai/api/v1 |
+
+Plus the special alias **`auto`**, which activates automatic routing/escalation.
+
+The router is completely model- and GPU-agnostic: it only talks to OpenAI-compatible HTTP endpoints. Both local models are expected to stay running (no model loading/unloading in v1).
+
+## Quick start
+
+```bash
+# 1. Install
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+# 2. Configure
+cp config.example.yaml config.yaml      # edit backends, model names, limits
+cp .env.example .env                    # set OPENROUTER_API_KEY (or export it)
+
+# 3. Run
+llm-router --config config.yaml         # or: python -m router --config config.yaml
+
+# 4. Smoke test
+curl -s http://127.0.0.1:8000/health | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"local-fast","messages":[{"role":"user","content":"hi"}]}'
+```
+
+CLI options: `--config PATH` (default `config.yaml`), `--host`, `--port`, `--log-level`.
+
+## API
+
+OpenAI-compatible, so any OpenAI client works by pointing its base URL at the router.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /v1/chat/completions` | Chat completions (streaming + non-streaming) |
+| `GET  /v1/models` | Logical model aliases (`auto`, `local-fast`, `local-deep`, `frontier`) |
+| `GET  /health` | Overall status + per-backend health/latency |
+| `GET  /health/backends` | Per-backend health only |
+| `GET  /metrics` | Prometheus text format |
+| `POST /events` | Lifecycle events from Claude Code hooks (see below) |
+
+### Request headers
+
+```http
+X-LLM-Session-ID: <id>     # groups requests into a session (generated if absent)
+X-LLM-Task-ID:    <id>     # one unit of work; escalation state is per-task
+X-LLM-Escalate:   deep|frontier   # rule A: force this tier now (subject to cloud limits)
+X-LLM-Route:      fast|deep|frontier|auto  # direct routing for this request only
+```
+
+Routing priority: **escalation header → route header → explicit model → session/task route → auto policy → configured default**.
+
+### Responses
+
+Every response carries an `x_router` block with the metadata you need to observe and act on routing decisions:
+
+```json
+{
+  "id": "...", "object": "chat.completion", "choices": [ ... ],
+  "x_router": {
+    "request_id": "abc123",
+    "session_id": "sess-...",
+    "task_id": "task-...",
+    "route": "deep",
+    "backend": "local-deep",
+    "reason": "auto_policy",
+    "escalation": { "from": "fast", "to": "deep", "reason": "repeated_test_failure", "attempts": 2 }
+  }
+}
+```
+
+`escalation` is present when the task's route moved (or, for blocked cloud calls, as `{"required": true, "to": "frontier", "reason": "..."}`). For streaming responses the same block arrives in a final SSE chunk just before `data: [DONE]`.
+
+### Escalation-required response
+
+When automatic cloud escalation is disabled or a budget limit is hit, the router returns HTTP 200 with a valid completion whose content starts with `[llm-router] escalation required:` and whose `x_router.escalation.required` is `true` — so OpenAI-compatible clients don't crash while still being able to detect the situation (e.g. via a hook) and retry with `X-LLM-Escalate: frontier`.
+
+## Automatic routing & escalation
+
+`auto` always starts on `routing.default` (`fast`). It escalates only on **deterministic signals** — no LLM is invoked to judge difficulty, and the model never has to know it's struggling:
+
+| Rule | Signal | Default threshold |
+|------|--------|-------------------|
+| A | Explicit request (`X-LLM-Escalate` header or `explicit_escalation` event) | immediate |
+| B | Repeated **test** failures within one task, on the current tier | 2 → next tier |
+| C | Repeated **tool** failures within one task, on the current tier | 2 → next tier |
+| D | Retry limit: `max_*_attempts` requests to the current tier **and** ≥1 recorded failure signal | fast: 2, deep: 2 |
+
+Chain: `fast → deep → frontier` (configurable). Failure counters reset when a task escalates or completes. Each rule can be switched off under `routing.escalation.signals`.
+
+**Backend failure ≠ model failure.** A crashed llama-server (connection refused, 5xx, timeout) does *not* mean "the model was too weak". Backend failures go through the configured **fallback policy** (`routing.fallbacks`) and do not change task state — unless you explicitly enable the `timeout`/`backend_error` signals.
+
+## Cloud cost protection
+
+The frontier tier is guarded by hard limits:
+
+- `cloud.enabled` — master switch (off = even manual frontier requests are blocked)
+- `cloud.allow_automatic_escalation` — **opt-in**; recommended `false` for the first deployment
+- `cloud.max_requests_per_hour` — rolling hourly request cap
+- `cloud.max_estimated_cost_usd_per_day` — daily cost estimate from response `usage` × `cloud.pricing` (set prices for your OpenRouter model)
+- `cloud.allow_manual_when_limited` — explicit `X-LLM-Escalate: frontier` still works at the limit
+
+When a limit blocks an *automatic* call you get the escalation-required response above; no uncontrolled billing loop.
+
+## Claude Code integration
+
+See [`integrations/claude_code/README.md`](integrations/claude_code/README.md) for the full guide, including:
+
+- pointing Claude Code at the router (direct or via a translation proxy),
+- an installable **CLAUDE.md escalation policy** (`integrations/claude_code/CLAUDE.md`),
+- hook scripts that emit `test_failure` / `tool_failure` events to `/events`,
+- the `escalation.sh` helper for calling deeper tiers from shell/subagents.
+
+The intended workflow: the main agent works on `local-fast`; when a subtask is hard it delegates to a **deep subagent** (a fresh request with `X-LLM-Escalate: deep` or `model: local-deep`) instead of restarting the whole conversation at another model; frontier is the last resort.
+
+## Events (`POST /events`)
+
+```json
+{ "session_id": "abc", "task_id": "task-123", "event": "test_failure",
+  "metadata": { "command": "pytest", "exit_code": 1 } }
+```
+
+Supported events: `task_start`, `task_complete`, `task_failure`, `tool_failure`, `test_failure`, `explicit_escalation` (optional `metadata.target`). Unknown events are accepted and logged at debug level. The response reports the resulting route:
+
+```json
+{ "status": "ok", "route": "deep", "escalated": true, ... }
+```
+
+## Observability
+
+- One structured log line per request: `request=… session=… task=… route=… backend=… latency=… status=…`
+- Escalations logged as `ESCALATION session=… task=… from=fast to=deep reason=repeated_test_failure count=2`
+- Prometheus metrics at `/metrics`: `router_requests_total`, `router_request_latency_seconds`, `router_backend_requests_total`, `router_backend_errors_total`, `router_escalations_total`, `router_cloud_requests_total`, `router_cloud_blocked_total`, `router_tool_failures_total`, `router_test_failures_total` (low-cardinality labels; never raw session IDs)
+- Prompt/response logging is **off by default** (`logging.log_prompts` / `log_responses`)
+
+## Security
+
+Binds to `127.0.0.1` by default. API keys live in environment variables (named via `api_key_env`), are read lazily, and are never printed or logged — header dumps mask `Authorization`/`X-Api-Key`.
+
+## Testing
+
+The whole suite runs with **no GPU, no llama-server, no OpenRouter, no Claude Code** — every backend is a mock:
+
+```bash
+pip install -e ".[dev]"
+pytest            # 60+ tests across routing, escalation, sessions, streaming, tools, backends, cloud limits
+```
+
+## Project layout
+
+```text
+llm-router/
+├── pyproject.toml
+├── config.example.yaml      .env.example   LICENSE   README.md
+├── router/                  # the service (see PRD §35)
+│   ├── api.py               # FastAPI app + request flow
+│   ├── routing.py           # Router, route priority, CloudBudget
+│   ├── escalation.py        # EscalationController (rules A–D)
+│   ├── sessions.py          # in-memory session/task state
+│   ├── events.py            # POST /events handling
+│   ├── config.py  models.py metrics.py server.py __main__.py
+│   └── backends/            # base, openai_compatible, openrouter, mock
+├── integrations/claude_code/# README, CLAUDE.md policy, escalation.sh, hooks/
+├── deploy/llm-router.service# example systemd unit
+├── docs/backends.md         # llama-server startup commands
+└── tests/                   # full mock-based suite
+```
+
+## Not in v1 (deliberately)
+
+AI request classification, prompt/response rewriting, RAG/vector DBs, web search, GUI, database, conversation summarization, GPU/model lifecycle management, automatic llama-server restarts. See PRD §41–44 for the future roadmap.
