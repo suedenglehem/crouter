@@ -11,6 +11,12 @@ Routing priority (highest first):
 ``auto`` always starts on ``routing.default`` (fast in the example config);
 it only moves up when the EscalationController says so (PRD §10). No LLM is
 invoked to judge difficulty.
+
+After the priority above, a **context floor** applies: if the request's
+estimated context need exceeds the chosen tier's ``max_context``, the tier is
+bumped up the escalation chain until it fits (reason ``context_overflow``).
+This is per-request and does not change task state — long conversations must
+use the bigger window even when the task itself is easy.
 """
 
 from __future__ import annotations
@@ -48,6 +54,8 @@ REASON_EXPLICIT_ROUTE_HEADER = "explicit_route_header"
 REASON_EXPLICIT_MODEL = "explicit_model"
 REASON_AUTO_POLICY = "auto_policy"
 REASON_DEFAULT = "default"
+#: The request's estimated context exceeds the selected tier's max_context.
+REASON_CONTEXT_OVERFLOW = "context_overflow"
 
 
 @dataclass(frozen=True)
@@ -79,8 +87,28 @@ class Router:
         headers: dict[str, str],
         session: SessionState,
         task: TaskState,
+        required_context: Optional[int] = None,
     ) -> RouteDecision:
-        """Apply the routing priority. ``headers`` keys must be lower-cased."""
+        """Apply the routing priority, then the context floor.
+
+        ``headers`` keys must be lower-cased. ``required_context`` is the
+        request's estimated context need (prompt + completion headroom); when
+        given and larger than the chosen tier's ``max_context``, the decision
+        is bumped up the escalation chain until it fits — even over an
+        explicitly requested tier, since that backend would reject the prompt.
+        """
+        decision = self._resolve_base(model=model, headers=headers, session=session, task=task)
+        return self._apply_context_floor(decision, required_context, session, task)
+
+    def _resolve_base(
+        self,
+        *,
+        model: Optional[str],
+        headers: dict[str, str],
+        session: SessionState,
+        task: TaskState,
+    ) -> RouteDecision:
+        """Routing priority only (no context floor)."""
         # 1a. explicit escalation header (rule A) — subject to cloud limits later.
         h_esc = headers.get("x-llm-escalate", "").strip().lower()
         if h_esc in ALIAS_TO_TIER:
@@ -126,6 +154,51 @@ class Router:
             reason=REASON_AUTO_POLICY,
             escalation=decision.escalation or esc,
         )
+
+    # -- context floor ---------------------------------------------------------
+
+    def _apply_context_floor(
+        self,
+        decision: RouteDecision,
+        required: Optional[int],
+        session: SessionState,
+        task: TaskState,
+    ) -> RouteDecision:
+        """Bump the tier up the chain until its max_context fits ``required``.
+
+        Per-request only (like backend fallback): it does not mutate task or
+        session state, so a short subagent conversation still starts on fast.
+        Tiers with no configured ``max_context`` are assumed to fit. The walk
+        stops at the top of the chain — if even that cannot fit, the request
+        goes there anyway and the backend's own error is more precise than ours.
+        """
+        if required is None:
+            return decision
+        tier = decision.tier
+        while True:
+            bcfg = self._cfg.backends.get(tier)
+            limit = bcfg.max_context if bcfg is not None else None
+            if limit is None or required <= limit:
+                break
+            nxt = self._controller.next_tier(tier)
+            if nxt is None:
+                break
+            tier = nxt
+        if tier == decision.tier:
+            return decision
+
+        # Reuse Escalation for the x_router block; its ``count`` field carries
+        # the estimated token requirement (not an attempt count).
+        esc = Escalation(decision.tier, tier, REASON_CONTEXT_OVERFLOW, required)
+        log.info(
+            "CONTEXT-OVERFLOW session=%s task=%s from=%s to=%s required_tokens~%d",
+            session.session_id,
+            task.task_id,
+            decision.tier,
+            tier,
+            required,
+        )
+        return replace(decision, tier=tier, reason=REASON_CONTEXT_OVERFLOW, escalation=esc)
 
     # -- backend fallback (PRD §31) ---------------------------------------------
 

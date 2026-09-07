@@ -49,6 +49,10 @@ class BackendConfig(BaseModel):
     api_key_env: Optional[str] = None
     timeout_seconds: float = 300.0
     extra_headers: dict[str, str] = Field(default_factory=dict)
+    #: Hard context window of this backend's model (prompt + completion).
+    #: ``None`` means "unknown / assume it fits" — the context floor never
+    #: bumps away from such a tier on size grounds.
+    max_context: Optional[int] = None
 
     # Mock-backend knobs (ignored by the other types).
     behavior: Literal["success", "stream", "tool_call", "error", "timeout", "echo"] = "success"
@@ -79,6 +83,28 @@ class EscalationConfig(BaseModel):
     chain: list[str] = Field(default_factory=lambda: ["fast", "deep", "frontier"])
 
 
+class ContextRoutingConfig(BaseModel):
+    """Context-length routing ("context floor").
+
+    A request whose estimated size (prompt + completion headroom) exceeds the
+    selected tier's ``max_context`` is bumped up the escalation chain until it
+    fits — regardless of how the tier was chosen. This complements the
+    complexity-based escalation rules: context only grows within a session, so
+    long conversations must move to the bigger window even when the task is easy.
+    """
+
+    enabled: bool = True
+    #: Conservative chars-per-token divisor applied to the serialized request
+    #: body (messages + tools + JSON overhead). Smaller = more tokens estimated
+    #: = earlier bump to a bigger tier. 3 suits code-heavy agent traffic; the
+    #: server-side chat template adds per-message tokens the client never sees,
+    #: so erring high is deliberate.
+    chars_per_token: float = Field(default=3.0, gt=0)
+    #: Tokens reserved for the completion when the client gives no max_tokens
+    #: (llama-server would otherwise generate until EOS or a full context).
+    completion_reserve: int = Field(default=8192, ge=0)
+
+
 class RoutingConfig(BaseModel):
     #: Tier that ``auto`` starts on (and the tier used when no model is given).
     default: str = "fast"
@@ -88,6 +114,7 @@ class RoutingConfig(BaseModel):
     #: when ``cloud.enabled`` is true.
     fallbacks: dict[str, list[str]] = Field(default_factory=dict)
     escalation: EscalationConfig = Field(default_factory=EscalationConfig)
+    context: ContextRoutingConfig = Field(default_factory=ContextRoutingConfig)
 
     @field_validator("default")
     @classmethod

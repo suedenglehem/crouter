@@ -53,3 +53,16 @@ OpenAI-compatible proxy on :8000 in front of three tiers — `local-fast` (llama
 
 - Nothing blocking. Optional: real llama-server + OpenRouter integration pass; `git init` (the dir is not a repo yet); deploy via `deploy/llm-router.service`.
 - PRD §41 "not in v1" list was deliberately honored: no RAG, GUI, database, model loading/unloading, GPU management.
+
+## Live on this machine (2026-09-07)
+
+Running at `127.0.0.1:8000` with `llm-router/config.yaml` (created from the example). Real backends instead of mocks; OpenRouter not used yet:
+
+| tier | model | llama-server | started by |
+|------|-------|--------------|------------|
+| fast | Qwen3.5-9B-Claude-HighIQ | :8081 (GPU2) | `/dd2/llama-server/qw9claude.sh` |
+| deep | Qwen3.8-27B-Uncensored | :8080 (dual 3090, MTP draft) | `/dd2/llama-server/qw_uncensored_mtp_q8_claude.sh` |
+
+Config notes: chain is `[fast, deep, frontier]` (frontier is a placeholder — OpenRouter not wired up yet), `cloud.enabled: false`; each backend's `model:` is the **full GGUF path** llama-server reports at `/v1/models` (the router rewrites every request's model field to it). Verified live: health on both tiers, non-streaming + streaming completions, `auto`→fast, rule-B escalation via `POST /events` (2× test_failure → deep), metrics. Start command: `.venv/bin/llm-router --config config.yaml`.
+
+**Context floor added (2026-09-07).** Routing now also switches on context length, not just complexity: each backend has a `max_context` (fast 32768, deep 256000); a request whose estimated size (serialized body / `chars_per_token`=3 + client `max_tokens` or `completion_reserve`=8192) exceeds the selected tier's limit is bumped up the chain until it fits — even over an explicit model choice. Per-request, no task-state change; shows as `x_router.reason: context_overflow`, counts in `router_escalations_total`. Code: `router/context.py` (estimator), `Router._apply_context_floor` in `routing.py`; config under `routing.context:`. 97/97 tests pass (`tests/test_context_routing.py` covers it). Live-verified: ~120KB body → deep, ~900KB body → frontier placeholder → clean "escalation required (cloud_disabled)" response since cloud is off. To enable real overflow-to-cloud later: set the frontier `model`, export `OPENROUTER_API_KEY`, flip `cloud.enabled` to true.

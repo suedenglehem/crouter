@@ -18,6 +18,7 @@ backends:
     base_url: "http://127.0.0.1:8001/v1"
     model: "local-fast"           # the real model name to send to this backend
     timeout_seconds: 300
+    max_context: 32768            # hard ctx window of this model (prompt + completion)
 
   deep:
     type: "openai_compatible"     # llama-server :8002 (dual GPU)
@@ -25,6 +26,7 @@ backends:
     base_url: "http://127.0.0.1:8002/v1"
     model: "local-deep"
     timeout_seconds: 600
+    max_context: 256000
 
   frontier:
     type: "openrouter"            # OpenAI-compatible + API key from environment
@@ -33,9 +35,17 @@ backends:
     model: "MODEL_NAME"           # e.g. anthropic/claude-sonnet-4 — never hard-coded in code
     api_key_env: "OPENROUTER_API_KEY"
     timeout_seconds: 900
+    max_context: null             # unknown window -> assumed to fit (overflow target)
 
 routing:
   default: "fast"                 # tier that `auto` starts on (PRD §10)
+
+  # Context floor: a request whose estimated size exceeds the selected tier's
+  # max_context is bumped up the chain until it fits (per-request, no state).
+  context:
+    enabled: true
+    chars_per_token: 3.0          # conservative divisor for the serialized body
+    completion_reserve: 8192      # headroom when the client gives no max_tokens
 
   # Backend-fallback policy (PRD §31). A *backend* failure (crash, 5xx,
   # timeout) is NOT a model-quality failure — it falls back here instead of

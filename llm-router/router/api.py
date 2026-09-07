@@ -31,11 +31,12 @@ from . import __version__
 from .backends import build_backends
 from .backends.base import Backend, BackendError, BackendResult
 from .config import AppConfig
+from .context import required_context
 from .escalation import EscalationController
 from .events import handle_event
 from .metrics import MetricsRegistry, register_router_metrics
 from .models import EventIn, build_escalation_required, error_body, x_router_meta
-from .routing import ALIAS_TO_TIER, CloudBudget, Router, UnknownModel
+from .routing import ALIAS_TO_TIER, CloudBudget, REASON_CONTEXT_OVERFLOW, Router, UnknownModel
 from .sessions import SessionState, SessionStore, TaskState
 
 log = logging.getLogger("router.api")
@@ -154,10 +155,12 @@ def create_app(cfg: AppConfig) -> FastAPI:
         if cfg.logging.log_prompts:
             log.debug("prompt messages=%d first=%r", len(body["messages"]), str(body["messages"][0])[:500])
 
-        # -- route resolution (priority order, PRD §7) -------------------------
+        # -- route resolution (priority order, PRD §7 + context floor) ---------
+        required_ctx = required_context(body, cfg.routing.context)
         try:
             decision = router.resolve(
-                model=body.get("model"), headers=lc_headers, session=session, task=task
+                model=body.get("model"), headers=lc_headers, session=session, task=task,
+                required_context=required_ctx,
             )
         except UnknownModel as e:
             return JSONResponse(
@@ -170,6 +173,16 @@ def create_app(cfg: AppConfig) -> FastAPI:
 
         decision = router.apply_attempt(decision, session, task)
         esc_dict = decision.escalation.as_dict() if decision.escalation else None
+
+        # Context-floor bumps are route escalations too (PRD §33).
+        if decision.reason == REASON_CONTEXT_OVERFLOW and decision.escalation is not None:
+            M["escalations_total"].inc(
+                **{
+                    "from": decision.escalation.from_tier or "none",
+                    "to": decision.tier,
+                    "reason": REASON_CONTEXT_OVERFLOW,
+                }
+            )
 
         def _meta(tier: str, backend_name: str, reason: str, escalation: Optional[dict]) -> dict[str, Any]:
             return x_router_meta(
