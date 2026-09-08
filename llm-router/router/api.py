@@ -9,6 +9,8 @@ Endpoints:
     GET  /health/backends       per-backend health only
     GET  /metrics               Prometheus text format
     POST /events                lifecycle events from Claude Code hooks
+    GET  /ctxlen                current context-length bounds per tier (admin)
+    GET  /ctxlen/<tier>=<n|reset>  set/reset a tier's max_context at runtime (admin)
 
 The request body is proxied to the selected backend verbatim (except the
 ``model`` field, which is rewritten there) — no summarizing, truncating or
@@ -94,9 +96,16 @@ def create_app(cfg: AppConfig) -> FastAPI:
     M = register_router_metrics(registry)
     cloud = CloudBudget(cfg)
 
+    # Effective max_context per tier as of startup — what ``/ctxlen/<tier>=reset``
+    # restores. Seeded from the config and re-snapshotted after the
+    # query_context_size sync, so "initial" means the value the router actually
+    # started serving with (queried size wins over a stale manual one).
+    initial_ctx: dict[str, Optional[int]] = {t: b.max_context for t, b in cfg.backends.items()}
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         await sync_context_sizes(cfg, backends)
+        initial_ctx.update({t: b.max_context for t, b in cfg.backends.items()})
         yield
         for b in backends.values():
             await b.close()
@@ -154,6 +163,54 @@ def create_app(cfg: AppConfig) -> FastAPI:
         except Exception as e:  # pydantic ValidationError or bad JSON
             return JSONResponse(status_code=400, content=error_body(f"invalid event payload: {e}"))
         return handle_event(store, controller, registry, payload)
+
+    # ------------------------------------------------------------------ ctxlen (admin)
+
+    @app.get("/ctxlen")
+    async def get_ctxlen() -> Any:
+        """Current context-length bounds per tier, plus the startup baseline."""
+        return {
+            tier: {"max_context": bcfg.max_context, "initial_max_context": initial_ctx.get(tier)}
+            for tier, bcfg in cfg.backends.items()
+        }
+
+    @app.get("/ctxlen/{spec}")
+    async def set_ctxlen(spec: str) -> Any:
+        """Set or reset a tier's context-length bound at runtime.
+
+        ``GET /ctxlen/fast=32000`` sets fast's max_context to 32000;
+        ``GET /ctxlen/deep=reset`` restores deep's startup value (the config
+        value, or the queried size when query_context_size is on). The context
+        floor reads these live per request, so a change applies from the very
+        next routed request. In-memory only — restarting the router reverts to
+        the configuration file.
+        """
+        tier, sep, value = spec.partition("=")
+        if not sep:
+            return JSONResponse(
+                status_code=400, content={"error": f"expected <tier>=<tokens|reset>, got {spec!r}"}
+            )
+        bcfg = cfg.backends.get(tier)
+        if bcfg is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"unknown tier {tier!r}; expected one of {sorted(cfg.backends)}"},
+            )
+        old = bcfg.max_context
+        if value == "reset":
+            new = initial_ctx.get(tier)  # None when the config set no bound
+        else:
+            try:
+                new = int(value)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400, content={"error": f"invalid token count {value!r} for tier {tier!r}"}
+                )
+            if new <= 0:
+                return JSONResponse(status_code=400, content={"error": f"token count must be > 0, got {new}"})
+        bcfg.max_context = new
+        log.info("ctxlen %s: max_context %s -> %s", tier, old, new)
+        return {"tier": tier, "max_context": new, "previous_max_context": old}
 
     # ------------------------------------------------------------------ shared dispatch
 

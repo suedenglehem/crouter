@@ -1,10 +1,11 @@
 # Claude Code integration for llm-router
 
-Three pieces, all optional and independent — use as much or as little as you want:
+Four pieces, all optional and independent — use as much or as little as you want:
 
 1. **Routing** — point Claude Code (or its subagents) at the router so requests hit `local-fast` by default.
 2. **Behavioral policy** — an installable CLAUDE.md section that tells the agent *when* to ask for a stronger model.
 3. **Hooks + helper script** — emit lifecycle events (`test_failure`, `tool_failure`, ...) to `/events` and call deeper tiers from shell/subagents.
+4. **Context-bound steering** — change each tier's context-length bound on the live router from Claude Code (slash command or hook), no restart needed.
 
 The router itself never depends on CLAUDE.md (PRD §16): the policy is a behavioral guideline, not the authoritative escalation mechanism. The deterministic rules in the controller are.
 
@@ -106,3 +107,50 @@ See [`hooks/settings.example.json`](hooks/settings.example.json) for a ready-to-
 ```
 
 If deep fails twice as well, the same mechanism reaches `frontier` — provided `cloud.allow_automatic_escalation: true`; otherwise you get an "escalation required" response and can force it with `X-LLM-Escalate: frontier`.
+
+## 4. Steering context bounds at runtime (`/ctxlen`)
+
+Each tier's `max_context` (the context floor's bound) can be changed on the live router without a restart — e.g. after restarting a llama-server with a different `--ctx-size`, or to keep a long session pinned to fast:
+
+```bash
+curl -s http://127.0.0.1:8000/ctxlen/fast=32000   # fast bound -> 32000 tokens
+curl -s http://127.0.0.1:8000/ctxlen/deep=reset   # deep back to its startup value
+curl -s http://127.0.0.1:8000/ctxlen              # show current + initial bounds per tier
+```
+
+Or via the helper (same `LLM_ROUTER_URL` env as `escalation.sh`):
+
+```bash
+./ctxlen.sh fast=32000 ; ./ctxlen.sh deep=reset ; ./ctxlen.sh
+```
+
+The floor reads the bound live on every request, so a change applies from the very next routed request. `reset` restores the *effective startup* value — the config value, or the queried size when `query_context_size` overrode it at boot. Changes are in-memory only: restarting the router reverts to the configuration file. A successful call returns `{"tier", "max_context", "previous_max_context"}`; unknown tier → 404, bad value (`abc`, `0`, `-5`) → 400.
+
+### From inside Claude Code — slash command (manual steering)
+
+Copy [`ctxlen.md`](ctxlen.md) to `~/.claude/commands/ctxlen.md` (user-level: works from any project) or `.claude/commands/ctxlen.md` (project-level). Then, mid-session:
+
+```
+/ctxlen fast 32000     # set the fast bound to 32000 tokens
+/ctxlen deep reset     # restore deep's startup value
+/ctxlen                # show current bounds
+```
+
+The command runs the curl against the router and reports the JSON result, so you can verify what changed. Plain English works too ("set the router's fast context bound to 32000") — Claude will run the same curl via Bash.
+
+### Automatically at session start — hook
+
+If every Claude Code session should begin from known-good bounds (e.g. after a backend restart), add a `SessionStart` hook to your settings — `~/.claude/settings.json` for all projects, or `.claude/settings.json` for one project:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command",
+          "command": "/path/to/llm-router/integrations/claude_code/ctxlen.sh fast=reset && /path/to/llm-router/integrations/claude_code/ctxlen.sh deep=reset || true" }] }
+    ]
+  }
+}
+```
+
+The `|| true` keeps the hook quiet when the router is not up yet at session start. [`hooks/settings.example.json`](hooks/settings.example.json) includes this alongside the event hooks, ready to edit.

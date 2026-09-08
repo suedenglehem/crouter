@@ -73,6 +73,8 @@ OpenAI-compatible, so any OpenAI client works by pointing its base URL at the ro
 | `GET  /health/backends` | Per-backend health only |
 | `GET  /metrics` | Prometheus text format |
 | `POST /events` | Lifecycle events from Claude Code hooks (see below) |
+| `GET  /ctxlen` | Current context-length bounds per tier (+ startup baseline) |
+| `GET  /ctxlen/<tier>=<tokens\|reset>` | Set/reset a tier's `max_context` at runtime, e.g. `/ctxlen/fast=32000`, `/ctxlen/deep=reset` |
 
 ### Request headers
 
@@ -143,6 +145,16 @@ Chain: `fast → deep → frontier` (configurable). Failure counters reset when 
 **Context floor.** Independent of complexity, every request's estimated context need (prompt + completion headroom) is checked against the selected tier's `max_context` (per backend in config). If it doesn't fit, the request is bumped up the chain until it does — even over an explicitly requested tier, since that backend would reject the prompt anyway. This is per-request and does not change task state; long conversations move to the bigger window automatically. The estimate is a conservative chars-per-token heuristic over the serialized body (`routing.context.chars_per_token`, default 3) plus `max_tokens` if given, else `routing.context.completion_reserve`. Tiers without a configured `max_context` are assumed to fit. Bumps show up as `x_router.reason: context_overflow` and count in `router_escalations_total`.
 
 **Queried context sizes (PRD §52).** A manual `max_context` can go stale when the server is restarted with different arguments. Set `query_context_size: true` on a backend and the router asks it at startup for its real window — llama-server reports the effective `--ctx-size` via `GET /props` (`default_generation_settings.n_ctx`) — and uses that value instead of the config one (logged as `using queried context size N`). Backends without `/props` or failed queries keep the manual value.
+
+**Runtime steering.** The bounds can also be changed on a live router, no restart needed:
+
+```bash
+curl -s http://127.0.0.1:8000/ctxlen/fast=32000    # fast's bound -> 32000 tokens
+curl -s http://127.0.0.1:8000/ctxlen/deep=reset    # deep back to its startup value
+curl -s http://127.0.0.1:8000/ctxlen               # show current + initial bounds per tier
+```
+
+The context floor reads the bound live on every request, so a change applies from the very next routed request. `reset` restores the *effective startup* value — the config value, or the queried size when `query_context_size` overrode it at boot. Changes are in-memory only: restarting the router reverts to the configuration file. Unknown tier → 404, bad value (`abc`, `0`, `-5`) → 400; a successful call returns `{"tier", "max_context", "previous_max_context"}`. This is what Claude Code hooks/slash commands use to steer routing mid-session (see [`integrations/claude_code`](integrations/claude_code/README.md)).
 
 **Backend failure ≠ model failure.** A crashed llama-server (connection refused, 5xx, timeout) does *not* mean "the model was too weak". Backend failures go through the configured **fallback policy** (`routing.fallbacks`) and do not change task state — unless you explicitly enable the `timeout`/`backend_error` signals.
 

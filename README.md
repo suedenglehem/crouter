@@ -86,6 +86,30 @@ cl2 -p "Use the Bash tool to run exactly this command: echo hi. Then reply with 
 grep "route=" /tmp/llm-router.log | tail    # expect route=fast backend=local-fast for routine work
 ```
 
+## Steering context bounds at runtime (`/ctxlen`)
+
+Each tier's `max_context` bound (the context floor) can be changed on the live router without a restart — e.g. after restarting a llama-server with a different `--ctx-size`, or to pin a long session onto fast:
+
+```bash
+curl -s http://127.0.0.1:8000/ctxlen/fast=32000   # fast bound -> 32000 tokens
+curl -s http://127.0.0.1:8000/ctxlen/deep=reset   # deep back to its startup value
+curl -s http://127.0.0.1:8000/ctxlen              # show current + initial bounds per tier
+```
+
+The floor reads the bound live on every request, so a change applies from the very next routed request (bumps show up as `x_router.reason: context_overflow`). `reset` restores the *effective startup* value — the queried size when `query_context_size` overrode it at boot, otherwise the config number. Changes are in-memory only: restarting the router reverts to the YAML. A successful call returns `{"tier", "max_context", "previous_max_context"}`; unknown tier → 404, bad value (`abc`, `0`, `-5`) → 400.
+
+### From Claude Code (cl2)
+
+- **Slash command** — `/ctxlen <tier> <tokens|reset>` is installed at `~/.claude/commands/ctxlen.md` (source: [`llm-router/integrations/claude_code/ctxlen.md`](llm-router/integrations/claude_code/ctxlen.md)). Mid-session:
+  ```
+  /ctxlen fast 32000     # set the fast bound to 32000 tokens
+  /ctxlen deep reset     # restore deep's startup value
+  /ctxlen                # show current bounds
+  ```
+  It runs the curl and reports the JSON result so you can verify what changed. Plain English works too ("set the router's fast context bound to 32000").
+- **Shell helper** — `llm-router/integrations/claude_code/ctxlen.sh [tier=value]` (honors `LLM_ROUTER_URL`, default `http://127.0.0.1:8000`).
+- **Optional: auto-reset at session start** — a `SessionStart` hook in `~/.claude/settings.json` that runs the helper with `fast=reset && deep=reset || true`, so every cl2 session begins from known-good bounds even after backend restarts. Ready-to-edit example: [`llm-router/integrations/claude_code/hooks/settings.example.json`](llm-router/integrations/claude_code/hooks/settings.example.json).
+
 ## API quick reference (port 8000)
 
 | Endpoint | Purpose |
@@ -95,11 +119,12 @@ grep "route=" /tmp/llm-router.log | tail    # expect route=fast backend=local-fa
 | `GET  /v1/models` | logical aliases: `auto`, `local-fast`, `local-deep`, `frontier` |
 | `GET  /health`, `/metrics` | status, Prometheus metrics |
 | `POST /events` | lifecycle events from Claude Code hooks (`test_failure`, …) |
+| `GET  /ctxlen`, `/ctxlen/<tier>=<n\|reset>` | show/set/reset per-tier context bounds at runtime (admin) — see above |
 
 Every response carries an `x_router` block (route, backend, reason, escalation info). Routing priority: escalation header → route header → explicit model → session/task state → auto policy. Escalation is deterministic (repeated test/tool failures, retry limits — PRD §19–§20); backend *crashes* are fallbacks, not escalations.
 
 ## Tests
 
 ```bash
-cd llm-router && .venv/bin/pytest    # 123 tests, all mock backends — no GPU needed
+cd llm-router && .venv/bin/pytest    # 145 tests, all mock backends — no GPU needed
 ```
