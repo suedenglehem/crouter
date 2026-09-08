@@ -1,0 +1,100 @@
+# llm-router config for this machine (2026-09-07).
+# Two local tiers + a placeholder frontier; OpenRouter not wired up yet.
+#
+#   fast = Qwen3.5-9B-Claude-HighIQ  on :8081  (/dd2/llama-server/qw9claude.sh)          ctx 32768
+#   deep = Qwen3.8-27B-Uncensored    on :8080  (/dd2/llama-server/qw_uncensored_mtp_q8_claude.sh)  ctx 256000
+#
+# `model` values are the exact model ids llama-server reports at /v1/models
+# (full GGUF paths); the router rewrites every request's "model" to them.
+#
+# Context floor: requests whose estimated size exceeds a tier's max_context are
+# bumped up the chain until they fit — fast(32k) -> deep(256k) -> frontier.
+
+server:
+  host: "127.0.0.1"
+  port: 8000
+
+defaults:
+  route: "auto"          # auto starts on routing.default (fast) and escalates per policy
+
+backends:
+  fast:
+    type: "openai_compatible"
+    name: "local-fast"
+    base_url: "http://127.0.0.1:8081/v1"
+    model: "/mnt/models_sas_ssd/lmstudio/Models/mradermacher/Qwen3.5-9B-Claude-4.6-HighIQ-THINKING-HERETIC-UNCENSORED-GGUF/Qwen3.5-9B-Claude-4.6-HighIQ-THINKING-HERETIC-UNCENSORED.Q8_0.gguf"
+    timeout_seconds: 300
+    max_context: 132768      # --ctx-size in qw9claude.sh
+
+  deep:
+    type: "openai_compatible"
+    name: "local-deep"
+    base_url: "http://127.0.0.1:8080/v1"
+    model: "/dd2/lmstudio/Models/JonathanColetti/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-noMTP-Q8_0.gguf"
+    timeout_seconds: 600
+    max_context: 256000            # --ctx-size in qw_uncensored_mtp_q8_claude.sh
+
+  # Placeholder until OpenRouter is wired up. With cloud.enabled=false, a
+  # request that overflows deep gets the clean "escalation required" response
+  # instead of an error. To enable: set model + export OPENROUTER_API_KEY and
+  # flip cloud.enabled to true.
+  frontier:
+    type: "openrouter"
+    name: "frontier"
+    base_url: "https://openrouter.ai/api/v1"
+    model: "openrouter/model-name-here"
+    api_key_env: "OPENROUTER_API_KEY"
+    timeout_seconds: 900
+    max_context: null              # unknown window -> assumed to fit
+
+routing:
+  default: "fast"
+
+  # Backend-fallback policy (PRD §31). Empty = error when a backend is down.
+  # Set `deep: [fast]` if you'd rather degrade than error on a 27B crash.
+  fallbacks: {}
+
+  # Context floor: bump the tier up the chain until max_context fits the
+  # request (per-request; does not change task state).
+  context:
+    enabled: true
+    chars_per_token: 3.0           # conservative for code-heavy agent traffic
+    completion_reserve: 8192       # headroom when client sends no max_tokens
+
+  escalation:
+    enabled: true
+    max_fast_attempts: 2
+    max_deep_attempts: 2
+    failure_threshold: 2
+    allow_frontier: true           # overflow target; cloud gate still applies
+    signals:
+      explicit_request: true       # X-LLM-Escalate / explicit_escalation event
+      repeated_tool_failure: true
+      repeated_test_failure: true
+      timeout: false
+      backend_error: false
+    chain:
+      - fast
+      - deep
+      - frontier
+
+cloud:                             # OpenRouter not used right now (PRD §21)
+  enabled: false
+  allow_automatic_escalation: false
+  max_requests_per_hour: 100
+  max_estimated_cost_usd_per_day: 10.0
+  allow_manual_when_limited: true
+
+logging:
+  level: "INFO"
+  log_requests: true
+  log_responses: false
+  log_prompts: false
+
+metrics:
+  enabled: true
+
+health:
+  check_interval_seconds: 10
+  timeout_seconds: 2
+
