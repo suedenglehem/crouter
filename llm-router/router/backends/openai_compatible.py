@@ -42,8 +42,18 @@ class OpenAICompatibleBackend(Backend):
     # -- headers ---------------------------------------------------------
 
     def _request_headers(self) -> dict[str, str]:
-        """Headers sent with every request. Subclasses may add auth here."""
-        return dict(self._cfg.extra_headers or {})
+        """Headers sent with every request (chat, health, /props).
+
+        Adds ``Authorization: Bearer <key>`` when the backend resolves an API
+        key (literal ``api_key`` in config, else the env var named by
+        ``api_key_env``) — needed e.g. for llama-server started with
+        --api-key. An explicit Authorization in extra_headers wins.
+        """
+        headers = dict(self._cfg.extra_headers or {})
+        key = self._cfg.resolved_api_key()
+        if key and not any(k.lower() == "authorization" for k in headers):
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
 
     # -- chat completion ---------------------------------------------------
 
@@ -70,7 +80,8 @@ class OpenAICompatibleBackend(Backend):
         urls.append("/props")  # relative to base_url (.../v1/props)
         for url in dict.fromkeys(urls):
             try:
-                resp = await self._client.get(url)
+                # Auth headers too: llama-server applies --api-key to /props as well.
+                resp = await self._client.get(url, headers=self._request_headers() or None)
             except httpx.HTTPError:
                 continue
             if resp.status_code != 200:

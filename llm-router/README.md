@@ -203,7 +203,7 @@ Supported events: `task_start`, `task_complete`, `task_failure`, `tool_failure`,
 
 ## Security
 
-Binds to `127.0.0.1` by default. API keys live in environment variables (named via `api_key_env`), are read lazily, and are never printed or logged — header dumps mask `Authorization`/`X-Api-Key`.
+Binds to `127.0.0.1` by default. Backend API keys are preferably kept in environment variables (named via `api_key_env`, read lazily at request time); a literal `api_key:` in the YAML also works and takes precedence — for local servers started with e.g. llama-server's `--api-key`. Keys are sent as `Authorization: Bearer <key>` on chat, health and `/props` requests, and are never printed or logged — header dumps mask `Authorization`/`X-Api-Key`.
 
 ## Testing
 

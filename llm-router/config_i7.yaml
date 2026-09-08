@@ -23,6 +23,7 @@ backends:
     name: "local-fast"
     base_url: "http://127.0.0.1:8081/v1"
     model: "/mnt/models_sas_ssd/lmstudio/Models/mradermacher/Qwen3.5-9B-Claude-4.6-HighIQ-THINKING-HERETIC-UNCENSORED-GGUF/Qwen3.5-9B-Claude-4.6-HighIQ-THINKING-HERETIC-UNCENSORED.Q8_0.gguf"
+    api_key: "sk-lm-MPQbTEoE:w5ApvKzHoOuagP58O9h1"   # llama-server --api-key (both servers)
     timeout_seconds: 300
     max_context: 132768      # --ctx-size in qw9claude.sh (fallback if the query fails)
     query_context_size: true # ask llama-server for its real n_ctx at startup (PRD §52)
@@ -32,6 +33,7 @@ backends:
     name: "local-deep"
     base_url: "http://i7:8080/v1"
     model: "/dd2/lmstudio/Models/JonathanColetti/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-noMTP-Q8_0.gguf"
+    api_key: "sk-lm-MPQbTEoE:w5ApvKzHoOuagP58O9h1"   # llama-server --api-key (both servers)
     timeout_seconds: 600
     max_context: 172768            # --ctx-size in qw_uncensored_mtp_q8_claude.sh (fallback)
     query_context_size: true       # ask the server for its real n_ctx at startup (PRD §52)

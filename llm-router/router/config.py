@@ -1,12 +1,15 @@
 """Configuration loading and validation.
 
 The configuration is a single YAML file (see ``config.example.yaml``).
-API keys are never stored in the YAML: each backend names an environment
-variable via ``api_key_env`` and the key is read lazily at request time.
+API keys are preferably kept out of the YAML: each backend can name an
+environment variable via ``api_key_env`` and the key is read lazily at
+request time. A literal ``api_key`` in the YAML also works and takes
+precedence — handy for local llama-servers started with ``--api-key``.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -46,7 +49,12 @@ class BackendConfig(BaseModel):
     name: str
     base_url: Optional[str] = None
     model: Optional[str] = None
+    #: Environment variable holding the API key (read lazily at request time).
     api_key_env: Optional[str] = None
+    #: Literal API key in the YAML. Takes precedence over ``api_key_env`` —
+    #: for local servers where keeping the key out of the file is not worth it
+    #: (e.g. llama-server started with --api-key). Sent as ``Authorization: Bearer <key>``.
+    api_key: Optional[str] = None
     timeout_seconds: float = 300.0
     extra_headers: dict[str, str] = Field(default_factory=dict)
     #: Hard context window of this backend's model (prompt + completion).
@@ -64,6 +72,21 @@ class BackendConfig(BaseModel):
     response_text: str = "mock response"
     error_status: int = 500
     delay_seconds: float = 0.0
+
+    def resolved_api_key(self) -> Optional[str]:
+        """Effective API key, or ``None`` when the backend needs no auth.
+
+        The literal ``api_key`` wins; otherwise the variable named by
+        ``api_key_env`` is read from the environment at call time (so a
+        rotated key needs no restart).
+        """
+        if self.api_key:
+            return self.api_key
+        if self.api_key_env:
+            value = os.environ.get(self.api_key_env, "")
+            if value:
+                return value
+        return None
 
 
 class EscalationSignals(BaseModel):

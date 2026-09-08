@@ -56,6 +56,7 @@ curl -s http://127.0.0.1:8000/v1/models                        # auto, local-fas
 
 - **`backends.<tier>.model`** must be the *exact* model id the server reports at `/v1/models` — for llama-server that's the full GGUF file path. If a backend 404s on model, re-fetch and paste it.
 - **`backends.<tier>.max_context`** feeds the context floor (below). Keep it in sync with each server's `--ctx-size` — or set **`query_context_size: true`** on that backend and let the router fetch the real value at startup from llama-server (`GET /props` → effective `n_ctx`, PRD §52); a failed query falls back to the manual number. (On this box the queried values are 132864 for fast and 172800 for deep — both differ slightly from what's written in the config files.)
+- **`backends.<tier>.api_key`** — both llama-servers now run with `--api-key`, so the key is set literally here for `fast` and `deep` (repo is private, that's fine). The router sends it as `Authorization: Bearer <key>` on chat completions, health checks, *and* the `/props` context-size query. Prefer keeping secrets out of YAML? Use **`api_key_env: VAR_NAME`** instead — a literal `api_key` takes precedence over the env var when both are set.
 - **`routing.context.chars_per_token`** (default 3) — how conservatively prompt size is estimated from serialized body chars. Lower = more aggressive bumping to deeper tiers.
 - **`cloud.enabled: false`** right now — requests that overflow deep get a clean "escalation required" response instead of hitting OpenRouter.
 

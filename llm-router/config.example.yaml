@@ -23,6 +23,10 @@ backends:
                                   # context size and use that instead (llama-server
                                   # reports it via GET /props; PRD §52). A failed
                                   # query keeps max_context.
+    # API key, if the server requires one (e.g. llama-server --api-key):
+    #   api_key: "sk-lm-..."          literal in YAML — takes precedence over env
+    #   api_key_env: "MY_KEY_ENV"     read from environment at request time
+    # Sent as Authorization: Bearer <key> on chat, health and /props requests.
 
   deep:
     type: "openai_compatible"     # llama-server :8002 (dual GPU)

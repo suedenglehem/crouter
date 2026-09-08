@@ -187,3 +187,82 @@ def test_openrouter_missing_key_no_auth_header(monkeypatch):
 
     headers = b._request_headers()  # sync method; no event loop needed
     assert "authorization" not in headers
+
+
+# -- api key (literal in YAML, env fallback) ---------------------------------------
+
+def test_api_key_literal_sends_auth_header():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={})
+
+    b = make_backend(handler, cfg=make_cfg(api_key="sk-lm-test"))
+    run(b.chat_completion({"messages": []}, stream=False))
+    assert seen["headers"]["authorization"] == "Bearer sk-lm-test"
+
+
+def test_api_key_literal_applies_to_health_check():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={"data": []})
+
+    b = make_backend(handler, cfg=make_cfg(api_key="sk-lm-test"))
+    healthy, _ = run(b.health_check())
+    assert healthy is True
+    assert seen["headers"]["authorization"] == "Bearer sk-lm-test"
+
+
+def test_api_key_env_fallback_for_openai_compatible(monkeypatch):
+    monkeypatch.setenv("TEST_FAST_KEY", "sk-from-env")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    b = make_backend(handler, cfg=make_cfg(api_key_env="TEST_FAST_KEY"))
+    assert b._request_headers()["Authorization"] == "Bearer sk-from-env"
+
+
+def test_api_key_literal_wins_over_env(monkeypatch):
+    monkeypatch.setenv("TEST_FAST_KEY", "sk-from-env")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    b = make_backend(handler, cfg=make_cfg(api_key="sk-literal", api_key_env="TEST_FAST_KEY"))
+    assert b._request_headers()["Authorization"] == "Bearer sk-literal"
+
+
+def test_no_key_no_auth_header(monkeypatch):
+    monkeypatch.delenv("TEST_FAST_KEY", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    b = make_backend(handler)  # no api_key, no api_key_env
+    assert "authorization" not in b._request_headers()
+
+
+def test_extra_headers_authorization_wins_over_api_key():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    b = make_backend(handler, cfg=make_cfg(api_key="sk-lm-test", extra_headers={"Authorization": "Bearer sk-explicit"}))
+    assert b._request_headers()["Authorization"] == "Bearer sk-explicit"
+
+
+def test_openrouter_literal_api_key_wins(monkeypatch):
+    monkeypatch.setenv("TEST_OR_KEY", "sk-from-env")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    cfg = make_cfg(type="openrouter", api_key="sk-literal", api_key_env="TEST_OR_KEY")
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport, base_url="http://unit.test/v1")
+    b = OpenRouterBackend("frontier", cfg, health_cfg=HealthConfig(), client=client)
+
+    assert b._request_headers()["Authorization"] == "Bearer sk-literal"
