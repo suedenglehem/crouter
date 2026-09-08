@@ -73,7 +73,7 @@ The router speaks the native Anthropic Messages API (`POST /v1/messages`), so no
 
 ### 1. Launcher script (required)
 
-Install `/usr/local/bin/cl` (on this machine `cl2` exists with identical content — legacy name):
+Install `/usr/local/bin/cl` :
 
 ```sh
 #!/bin/sh
