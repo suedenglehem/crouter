@@ -1,3 +1,11 @@
-examples of llama-server used, attention, it was run on different cards, so, adjust your CUDA_VISIBLE_DEVICES 
-templates may be useful in claude code, you must edit them (do diff with .orig files), replace 1 line only,
-to create template of a gguf use python code provided with llama.cpp git, check shell in tpl dir
+scripts for serving models (ggufs) locally with llama-server
+
+i have 2 boxes, one with 4080s+4060ti 16gb (i7) and another (tr4) with 2 3090 + 3080ti
+
+so, with config_i7.yml there both fast & deep models have api access, 
+i'd run qwen38 27b on i7 (script deep.sh)  and qwen3.5 9b on 3080ti of tr4 (script fast.sh). this config
+is for dev mostly, cuz where would be also qwen3.8 27b running on 2 3090 (script qw_uncensored_mtp_q8_claude.sh)
+and claude code would use that model. it'd debug router on i7 and 3080ti.
+
+for testing config.yaml which is without api (sure, i don't need api key on llama servers 
+if i'm running full local), i'd run both qw9claude.sh and qw_uncensored_mtp_q8_claude.sh on tr4
