@@ -11,6 +11,10 @@ Endpoints:
     POST /events                lifecycle events from Claude Code hooks
     GET  /ctxlen                current context-length bounds per tier (admin)
     GET  /ctxlen/<tier>=<n|reset>  set/reset a tier's max_context at runtime (admin)
+    GET  /route                 current routing mode (pin) + bounds (admin)
+    GET  /route/all/<tier>      pin ALL traffic to one tier at its max window (admin)
+    GET  /route/reset           back to defaults: no pin, startup bounds (admin)
+    GET  /route/last            restore the pre-pin context bounds (admin)
 
 The request body is proxied to the selected backend verbatim (except the
 ``model`` field, which is rewritten there) — no summarizing, truncating or
@@ -212,6 +216,79 @@ def create_app(cfg: AppConfig) -> FastAPI:
         log.info("ctxlen %s: max_context %s -> %s", tier, old, new)
         return {"tier": tier, "max_context": new, "previous_max_context": old}
 
+    # ------------------------------------------------------------------ route (admin)
+
+    #: Authoritative pin state (GET /route/all/<tier>): every request goes to
+    #: one tier at its maximum known window until reset/last. In-memory only —
+    #: restarting the router clears the pin and reverts bounds to the config.
+    route_state: dict[str, Any] = {"pin": None, "saved_bounds": None}
+
+    def _route_view() -> dict[str, Any]:
+        return {
+            "pin": route_state["pin"],
+            "bounds": {t: b.max_context for t, b in cfg.backends.items()},
+            "initial_bounds": initial_ctx,
+        }
+
+    @app.get("/route")
+    async def get_route() -> Any:
+        """Current routing mode (pin) and context bounds per tier."""
+        return _route_view()
+
+    @app.get("/route/all/{tier}")
+    async def route_all(tier: str) -> Any:
+        """Authoritatively pin ALL traffic to one tier at its maximum window.
+
+        Saves the current context bounds first (restored by ``/route/last``),
+        sets the pinned tier's bound to its startup value — the config number,
+        or the queried size when query_context_size overrode it: the largest
+        window the router knows about — and forces every request onto that
+        tier until ``/route/reset`` or ``/route/last``. While pinned, the
+        context floor is skipped (reason ``pinned``), so even a prompt bigger
+        than the window gets the backend's own precise error instead of a
+        silent bump away from the pinned tier. Re-pinning to another tier
+        keeps the original pre-pin snapshot.
+        """
+        if tier not in cfg.backends:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"unknown tier {tier!r}; expected one of {sorted(cfg.backends)}"},
+            )
+        if route_state["pin"] is None:
+            # Snapshot the pre-pin bounds once; re-pinning keeps the original.
+            route_state["saved_bounds"] = {t: b.max_context for t, b in cfg.backends.items()}
+        old_pin = route_state["pin"]
+        route_state["pin"] = tier
+        cfg.backends[tier].max_context = initial_ctx.get(tier)
+        log.info("route pin: %s -> all/%s", old_pin or "none", tier)
+        return _route_view()
+
+    @app.get("/route/reset")
+    async def route_reset() -> Any:
+        """Back to the default configuration: no pin, bounds at startup values."""
+        for t, b in cfg.backends.items():
+            b.max_context = initial_ctx.get(t)
+        route_state["pin"] = None
+        route_state["saved_bounds"] = None
+        log.info("route reset: pin cleared, bounds restored to startup defaults")
+        return _route_view()
+
+    @app.get("/route/last")
+    async def route_last() -> Any:
+        """Restore the context bounds in effect right before /route/all/<tier>."""
+        if route_state["saved_bounds"] is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "no previous state to restore (no /route/all/... was issued)"},
+            )
+        for t, v in route_state["saved_bounds"].items():
+            if t in cfg.backends:
+                cfg.backends[t].max_context = v
+        route_state["pin"] = None
+        route_state["saved_bounds"] = None
+        log.info("route last: restored pre-pin bounds")
+        return _route_view()
+
     # ------------------------------------------------------------------ shared dispatch
 
     async def _dispatch(
@@ -271,6 +348,7 @@ def create_app(cfg: AppConfig) -> FastAPI:
             decision = router.resolve(
                 model=openai_body.get("model"), headers=lc_headers, session=session, task=task,
                 required_context=required_ctx,
+                pinned_tier=route_state["pin"],
             )
         except UnknownModel as e:
             return {"kind": "unknown_model", "model": e.args[0], "session_id": session.session_id, "task_id": task_id}

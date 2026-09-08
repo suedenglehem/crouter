@@ -56,6 +56,8 @@ REASON_AUTO_POLICY = "auto_policy"
 REASON_DEFAULT = "default"
 #: The request's estimated context exceeds the selected tier's max_context.
 REASON_CONTEXT_OVERFLOW = "context_overflow"
+#: An authoritative pin (GET /route/all/<tier>) forces every request to one tier.
+REASON_PINNED = "pinned"
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,7 @@ class Router:
         session: SessionState,
         task: TaskState,
         required_context: Optional[int] = None,
+        pinned_tier: Optional[str] = None,
     ) -> RouteDecision:
         """Apply the routing priority, then the context floor.
 
@@ -96,7 +99,15 @@ class Router:
         given and larger than the chosen tier's ``max_context``, the decision
         is bumped up the escalation chain until it fits — even over an
         explicitly requested tier, since that backend would reject the prompt.
+
+        ``pinned_tier`` (set via GET /route/all/<tier>) is authoritative: every
+        request goes to that tier regardless of model/headers/policy, and the
+        context floor is skipped — the pin already runs the tier at its maximum
+        known window, so a too-big prompt should get the backend's own precise
+        error rather than a silent bump away from the pinned tier.
         """
+        if pinned_tier is not None and pinned_tier in self._cfg.backends:
+            return RouteDecision(tier=pinned_tier, reason=REASON_PINNED, manual=True)
         decision = self._resolve_base(model=model, headers=headers, session=session, task=task)
         return self._apply_context_floor(decision, required_context, session, task)
 

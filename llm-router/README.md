@@ -75,6 +75,10 @@ OpenAI-compatible, so any OpenAI client works by pointing its base URL at the ro
 | `POST /events` | Lifecycle events from Claude Code hooks (see below) |
 | `GET  /ctxlen` | Current context-length bounds per tier (+ startup baseline) |
 | `GET  /ctxlen/<tier>=<tokens\|reset>` | Set/reset a tier's `max_context` at runtime, e.g. `/ctxlen/fast=32000`, `/ctxlen/deep=reset` |
+| `GET  /route` | Current routing mode (pin) + bounds per tier |
+| `GET  /route/all/<tier>` | Authoritatively pin ALL traffic to one tier at its max known window (`fast`/`deep`/`frontier`) |
+| `GET  /route/reset` | Back to defaults: no pin, startup bounds |
+| `GET  /route/last` | Restore the context bounds from right before `/route/all/<tier>` |
 
 ### Request headers
 
@@ -155,6 +159,8 @@ curl -s http://127.0.0.1:8000/ctxlen               # show current + initial boun
 ```
 
 The context floor reads the bound live on every request, so a change applies from the very next routed request. `reset` restores the *effective startup* value — the config value, or the queried size when `query_context_size` overrode it at boot. Changes are in-memory only: restarting the router reverts to the configuration file. Unknown tier → 404, bad value (`abc`, `0`, `-5`) → 400; a successful call returns `{"tier", "max_context", "previous_max_context"}`. This is what Claude Code hooks/slash commands use to steer routing mid-session (see [`integrations/claude_code`](integrations/claude_code/README.md)).
+
+For the stronger switch — pinning *all* traffic to one tier at its maximum window, with `reset`/`last` to get back out — see the `/route` endpoints above (`GET /route/all/<tier>`, `/route/reset`, `/route/last`).
 
 **Backend failure ≠ model failure.** A crashed llama-server (connection refused, 5xx, timeout) does *not* mean "the model was too weak". Backend failures go through the configured **fallback policy** (`routing.fallbacks`) and do not change task state — unless you explicitly enable the `timeout`/`backend_error` signals.
 
