@@ -22,6 +22,7 @@ Operator guide for running the router on this machine. Full specification: [`prd
 | `llm-router/` | the service (FastAPI), tests, integration scripts |
 | `prd/` | implementation specification (§1–§51) |
 | `start-router.sh` | symlink → `daemon/start-router_i7.sh` — the active setup |
+| `llms-ready.py` | readiness probe — sends a real chat request to each backend (`start-router.sh -c`) |
 | `daemon/` | launcher shells, one per configuration: `start-router_i7.sh` (**config_i7.yaml**, deep on LAN host `i7`), `start-router_local.sh` (**config.yaml**, fully local), `start-router_df.sh` (**yaml/config_df.yaml**, deep + frontier only) |
 | `llm-router/yaml/` | extra router configs: the frontier-simulation **config_df.yaml** and config.example.yaml (the active i7/local configs stay in `llm-router/`) |
 | `claude_part/`, `llama_part/` | tracked copies of the Claude Code launcher (`cl`) and example llama-server start scripts (with `--api-key`; adjust `CUDA_VISIBLE_DEVICES` per card) |
@@ -42,6 +43,7 @@ All launchers live in `daemon/` (the root `start-router.sh` is a symlink to the 
 ./daemon/start-router_local.sh   # fully local variant (config.yaml)
 ./daemon/start-router_df.sh      # deep + frontier only  (yaml/config_df.yaml, chain [deep -> frontier])
 ./start-router.sh status         # pid + health summary
+./start-router.sh -c             # readiness check: do fast/deep/frontier actually answer?
 ./start-router.sh stop
 ```
 
@@ -55,6 +57,27 @@ Check it's up:
 ```bash
 curl -s http://127.0.0.1:8000/health | python3 -m json.tool   # all backends healthy?
 curl -s http://127.0.0.1:8000/v1/models                        # auto, local-fast, local-deep, frontier
+```
+
+### Readiness check (`-c` / `--chk-ready`)
+
+`status` only proves the router is listening; `-c` goes one step further and sends a real minimal `/chat/completions` request straight to each backend's `base_url`, bypassing the router — so it works even when llm-router itself is down. It runs [`llms-ready.py`](llms-ready.py) with whichever config the active launcher uses:
+
+```bash
+./start-router.sh -c                                  # check the active setup
+./llms-ready.py --config llm-router/config_i7.yaml    # check a specific setup directly
+./llms-ready.py --json                                # machine-readable output
+```
+
+fast and deep are always probed; frontier is probed only when `cloud.enabled: true` in that config (otherwise reported as SKIP). Both local models are thinking models, so the probe counts *any* generated token (`content` or `reasoning_content`) as a live answer. Exit codes: 0 = all enabled backends answered, 1 = at least one failed, 2 = bad config. A healthy run:
+
+```text
+llms-ready — config /dd2/andrei/crouter/llm-router/config.yaml
+  fast     OK   http://127.0.0.1:8081/v1  257 ms  thinking only
+  deep     OK   http://127.0.0.1:8080/v1  3002 ms  thinking only
+  frontier SKIP   cloud disabled (cloud.enabled=false)
+
+READY — all enabled backends respond (fast, deep)
 ```
 
 ## Configuration (the parts that matter)

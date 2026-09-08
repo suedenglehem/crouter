@@ -4,6 +4,7 @@
 #   ./start-router.sh          start in background, wait for /health
 #   ./start-router.sh --fg     run in foreground (Ctrl-C to stop)
 #   ./start-router.sh status   show pid + health
+#   ./start-router.sh -c       check fast/deep/frontier answer real requests
 #   ./start-router.sh stop     stop the background instance
 set -euo pipefail
 
@@ -55,6 +56,10 @@ case "${1:-start}" in
     fi
     ;;
 
+  -c|--chk-ready)
+    "$ROUTER_DIR/llms-ready.py" --config "$CONFIG" "${@:2}"
+    ;;
+
   stop)
     pid=""
     if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
@@ -72,7 +77,7 @@ case "${1:-start}" in
     ;;
 
   *)
-    echo "usage: $0 [start|--fg|status|stop]" >&2
+    echo "usage: $0 [start|--fg|status|-c|--chk-ready|stop]" >&2
     exit 2
     ;;
 esac
