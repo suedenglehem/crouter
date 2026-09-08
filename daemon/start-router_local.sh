@@ -7,8 +7,9 @@
 #   ./start-router.sh stop     stop the background instance
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/llm-router"
-CONFIG="$DIR/config_i7.yaml"
+ROUTER_DIR=/dd2/andrei/crouter
+DIR="$ROUTER_DIR/llm-router"
+CONFIG="$DIR/config.yaml"
 LOG=/tmp/llm-router.log
 PIDFILE=/tmp/llm-router.pid
 URL=http://127.0.0.1:8000

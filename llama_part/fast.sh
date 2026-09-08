@@ -28,5 +28,5 @@ $llama_bin \
     --temp 0.1 \
     --top-p 0.95 \
     --min-p 0.05 \
-    --repeat-penalty 1.1 --chat-template-file $tpl_dir/qw35/qwen3.5_heretic_9b.jinja
-
+    --repeat-penalty 1.1 --chat-template-file $tpl_dir/qw35/qwen3.5_heretic_9b.jinja \
+    --api-key 'sk-lm-...'

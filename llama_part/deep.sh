@@ -34,6 +34,5 @@ $llama_bin  \
     --min-p 0.05 \
     --repeat-penalty 1.1 \
     --spec-type draft-mtp --spec-draft-n-max 5 --model-draft $d \
-    --chat-template-file $tpl_bin/qw38_q6/qwen3.8.jinja
-
-
+    --chat-template-file $tpl_bin/qw38_q6/qwen3.8.jinja \
+    --api-key 'sk-lm-...'

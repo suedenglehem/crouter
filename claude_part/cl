@@ -1,0 +1,12 @@
+#!/bin/sh
+
+nl=`ps aux | grep llm-router | wc -l`
+[ $nl -eq 0 ] && echo start llm-router && exit 1
+
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_API_KEY=local
+
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=80000
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=70000
+
+$HOME/.local/bin/claude --model auto $@
