@@ -53,6 +53,11 @@ class BackendConfig(BaseModel):
     #: ``None`` means "unknown / assume it fits" — the context floor never
     #: bumps away from such a tier on size grounds.
     max_context: Optional[int] = None
+    #: When true, query the backend at startup for its real context size and
+    #: use that instead of ``max_context`` (PRD §52). llama-server reports it
+    #: via GET /props (the effective --ctx-size actually in use); a failed
+    #: query keeps the manual value.
+    query_context_size: bool = False
 
     # Mock-backend knobs (ignored by the other types).
     behavior: Literal["success", "stream", "tool_call", "error", "timeout", "echo"] = "success"

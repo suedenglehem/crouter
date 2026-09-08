@@ -3,6 +3,7 @@
 Endpoints:
 
     POST /v1/chat/completions   OpenAI-compatible chat completions (streaming + non-streaming)
+    POST /v1/messages           Anthropic Messages API for Claude Code (PRD §51, streaming + non-streaming)
     GET  /v1/models             logical model aliases
     GET  /health                overall status + per-backend health
     GET  /health/backends       per-backend health only
@@ -11,8 +12,10 @@ Endpoints:
 
 The request body is proxied to the selected backend verbatim (except the
 ``model`` field, which is rewritten there) — no summarizing, truncating or
-rewriting in v1 (PRD §26). Every response carries an ``x_router`` block with
-request/session/task/route metadata and escalation context (PRD §27).
+rewriting in v1 (PRD §26). ``/v1/messages`` is the exception: it translates
+Anthropic <-> OpenAI so Claude Code can run its whole agent loop through the
+router. Every response carries an ``x_router`` block with request/session/task/
+route metadata and escalation context (PRD §27).
 """
 
 from __future__ import annotations
@@ -28,10 +31,18 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from . import __version__
+from .anthropic import (
+    anthropic_error,
+    anthropic_stream,
+    build_escalation_required_message,
+    to_anthropic_message,
+    to_openai_request,
+    wants_thinking,
+)
 from .backends import build_backends
 from .backends.base import Backend, BackendError, BackendResult
 from .config import AppConfig
-from .context import required_context
+from .context import estimate_prompt_tokens, required_context
 from .escalation import EscalationController
 from .events import handle_event
 from .metrics import MetricsRegistry, register_router_metrics
@@ -49,6 +60,31 @@ def mask_headers(headers: dict[str, str]) -> dict[str, str]:
     return {k: ("***" if k.lower() in SENSITIVE_HEADERS else v) for k, v in headers.items()}
 
 
+async def sync_context_sizes(cfg: AppConfig, backends: dict[str, Backend]) -> None:
+    """Apply ``query_context_size`` overrides at startup (PRD §52).
+
+    Backends flagged with ``query_context_size: true`` report their real
+    context window; that value replaces the manual ``max_context`` in config,
+    which may be stale. A failed query keeps the manual value.
+    """
+    for tier, bcfg in cfg.backends.items():
+        if not bcfg.query_context_size:
+            continue
+        n_ctx = await backends[tier].query_context_size()
+        if n_ctx is None:
+            log.warning(
+                "backend %s: context-size query failed; keeping configured max_context=%s",
+                tier, bcfg.max_context,
+            )
+            continue
+        if n_ctx != bcfg.max_context:
+            log.info(
+                "backend %s: using queried context size %d (config had %s)",
+                tier, n_ctx, bcfg.max_context,
+            )
+        bcfg.max_context = n_ctx
+
+
 def create_app(cfg: AppConfig) -> FastAPI:
     backends = build_backends(cfg)
     store = SessionStore(default_route=cfg.routing.default)
@@ -60,6 +96,7 @@ def create_app(cfg: AppConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        await sync_context_sizes(cfg, backends)
         yield
         for b in backends.values():
             await b.close()
@@ -118,6 +155,140 @@ def create_app(cfg: AppConfig) -> FastAPI:
             return JSONResponse(status_code=400, content=error_body(f"invalid event payload: {e}"))
         return handle_event(store, controller, registry, payload)
 
+    # ------------------------------------------------------------------ shared dispatch
+
+    async def _dispatch(
+        *,
+        request_id: str,
+        lc_headers: dict[str, str],
+        openai_body: dict[str, Any],
+        stream: bool,
+    ) -> dict[str, Any]:
+        """Route resolution + backend dispatch, shared by both API endpoints.
+
+        ``openai_body`` is what the backend will receive (the OpenAI endpoint
+        passes the client body through; /v1/messages passes its translation).
+        Returns a dict whose ``kind`` is one of:
+
+          * ``"unknown_model"`` — model not in the alias table -> 404
+          * ``"escalation"``    — frontier cloud gate blocked -> 200 sentinel body
+          * ``"error"``         — every backend for the tier failed -> 502
+          * ``"ok"``            — ``result``/``serving``/``x_router`` ready to render
+
+        Session identity: ``X-LLM-Session-ID``, falling back to Claude Code's
+        own ``X-Claude-Code-Session-ID`` so escalation state works out of the
+        box when ANTHROPIC_BASE_URL points here (PRD §17, §51).
+        """
+        session_key = lc_headers.get("x-llm-session-id") or lc_headers.get("x-claude-code-session-id")
+        session = store.get_or_create_session(session_key)
+        task_id_hdr = lc_headers.get("x-llm-task-id")
+        if task_id_hdr:
+            task_id = task_id_hdr
+        else:
+            session.request_seq += 1
+            task_id = f"{session.session_id}-r{session.request_seq}"
+        task = store.get_or_create_task(session, task_id)
+
+        def _meta(tier: str, backend_name: str, reason: str, escalation: Optional[dict]) -> dict[str, Any]:
+            return x_router_meta(
+                request_id=request_id,
+                session_id=session.session_id,
+                task_id=task_id,
+                tier=tier,
+                backend_name=backend_name,
+                reason=reason,
+                escalation=escalation,
+            )
+
+        if cfg.logging.log_requests:
+            log.info(
+                "request=%s session=%s task=%s model=%s stream=%s headers=%s",
+                request_id, session.session_id, task_id, openai_body.get("model"), stream, mask_headers(lc_headers),
+            )
+        if cfg.logging.log_prompts:
+            log.debug("prompt messages=%d first=%r", len(openai_body["messages"]), str(openai_body["messages"][0])[:500])
+
+        # -- route resolution (priority order, PRD §7 + context floor) ---------
+        required_ctx = required_context(openai_body, cfg.routing.context)
+        try:
+            decision = router.resolve(
+                model=openai_body.get("model"), headers=lc_headers, session=session, task=task,
+                required_context=required_ctx,
+            )
+        except UnknownModel as e:
+            return {"kind": "unknown_model", "model": e.args[0], "session_id": session.session_id, "task_id": task_id}
+
+        decision = router.apply_attempt(decision, session, task)
+        esc_dict = decision.escalation.as_dict() if decision.escalation else None
+
+        # Context-floor bumps are route escalations too (PRD §33).
+        if decision.reason == REASON_CONTEXT_OVERFLOW and decision.escalation is not None:
+            M["escalations_total"].inc(
+                **{
+                    "from": decision.escalation.from_tier or "none",
+                    "to": decision.tier,
+                    "reason": REASON_CONTEXT_OVERFLOW,
+                }
+            )
+
+        # -- cloud gate for frontier (PRD §21/§22) ------------------------------
+        if decision.tier == "frontier":
+            allowed, why = cloud.allows(manual=decision.manual)
+            if not allowed:
+                M["cloud_blocked_total"].inc(reason=why or "unknown")
+                x_router = _meta(
+                    "frontier", backends["frontier"].name, decision.reason,
+                    {"required": True, "to": "frontier", "reason": why},
+                )
+                return {
+                    "kind": "escalation", "x_router": x_router,
+                    "session_id": session.session_id, "task_id": task_id,
+                }
+
+        # -- dispatch with backend fallback (PRD §31; NOT an escalation) --------
+        result: Optional[BackendResult] = None
+        serving: Optional[Backend] = None
+        last_error: Optional[BackendError] = None
+        for candidate in _candidates(decision.tier):
+            M["backend_requests_total"].inc(backend=candidate.name)
+            if candidate.tier == "frontier":
+                M["cloud_requests_total"].inc()
+            try:
+                result = await candidate.chat_completion(openai_body, stream=stream)
+                serving = candidate
+                break
+            except BackendError as e:
+                last_error = e
+                M["backend_errors_total"].inc(backend=candidate.name, kind=e.kind)
+                log.warning("backend %s failed (kind=%s): %s", candidate.name, e.kind, e)
+
+        if result is None or serving is None:
+            assert last_error is not None
+            store.mark_error(session, str(last_error))
+            _note_request_failure(session, task, serving_tier=decision.tier, manual=decision.manual, kind=last_error.kind)
+            x_router = _meta(decision.tier, backends[decision.tier].name, "backend_unavailable", esc_dict)
+            return {
+                "kind": "error", "tier": decision.tier,
+                "message": f"backend '{decision.tier}' unavailable: {last_error}",
+                "x_router": x_router,
+                "session_id": session.session_id, "task_id": task_id,
+            }
+
+        # A non-2xx from the backend (e.g. 400) is forwarded to the client; if
+        # the backend_error signal is enabled it also counts toward rule D.
+        if result.status_code >= 400:
+            _note_request_failure(session, task, serving_tier=serving.tier, manual=decision.manual, kind="backend_error")
+
+        store.record_request(session, task, serving.tier, serving.name)
+
+        # -- response metadata ---------------------------------------------------
+        served_reason = decision.reason if serving.tier == decision.tier else "backend_fallback"
+        x_router = _meta(serving.tier, serving.name, served_reason, esc_dict)
+        return {
+            "kind": "ok", "result": result, "serving": serving, "x_router": x_router,
+            "session_id": session.session_id, "task_id": task_id,
+        }
+
     # ------------------------------------------------------------------ chat completions
 
     @app.post("/v1/chat/completions")
@@ -135,120 +306,41 @@ def create_app(cfg: AppConfig) -> FastAPI:
                 content=error_body("'messages' (a non-empty list) is required"),
             )
 
-        session = store.get_or_create_session(lc_headers.get("x-llm-session-id"))
-        task_id_hdr = lc_headers.get("x-llm-task-id")
-        if task_id_hdr:
-            task_id = task_id_hdr
-        else:
-            session.request_seq += 1
-            task_id = f"{session.session_id}-r{session.request_seq}"
-        task = store.get_or_create_task(session, task_id)
-
         t0 = time.perf_counter()
         stream = bool(body.get("stream", False))
 
-        if cfg.logging.log_requests:
-            log.info(
-                "request=%s session=%s task=%s model=%s stream=%s headers=%s",
-                request_id, session.session_id, task_id, body.get("model"), stream, mask_headers(lc_headers),
-            )
-        if cfg.logging.log_prompts:
-            log.debug("prompt messages=%d first=%r", len(body["messages"]), str(body["messages"][0])[:500])
+        outcome = await _dispatch(request_id=request_id, lc_headers=lc_headers, openai_body=body, stream=stream)
 
-        # -- route resolution (priority order, PRD §7 + context floor) ---------
-        required_ctx = required_context(body, cfg.routing.context)
-        try:
-            decision = router.resolve(
-                model=body.get("model"), headers=lc_headers, session=session, task=task,
-                required_context=required_ctx,
-            )
-        except UnknownModel as e:
+        if outcome["kind"] == "unknown_model":
             return JSONResponse(
                 status_code=404,
                 content=error_body(
-                    f"unknown model {e.args[0]!r}; expected one of auto|local-fast|local-deep|frontier",
+                    f"unknown model {outcome['model']!r}; expected one of auto|local-fast|local-deep|frontier",
                     "model_not_found",
                 ),
             )
 
-        decision = router.apply_attempt(decision, session, task)
-        esc_dict = decision.escalation.as_dict() if decision.escalation else None
-
-        # Context-floor bumps are route escalations too (PRD §33).
-        if decision.reason == REASON_CONTEXT_OVERFLOW and decision.escalation is not None:
-            M["escalations_total"].inc(
-                **{
-                    "from": decision.escalation.from_tier or "none",
-                    "to": decision.tier,
-                    "reason": REASON_CONTEXT_OVERFLOW,
-                }
+        if outcome["kind"] == "escalation":
+            x_router = outcome["x_router"]
+            resp_body = build_escalation_required(
+                request_id=request_id, model_alias=body.get("model"), x_router=x_router
             )
+            _finish(request_id, outcome["session_id"], outcome["task_id"], "frontier", backends["frontier"].name, t0, 200)
+            return JSONResponse(status_code=200, content=resp_body)
 
-        def _meta(tier: str, backend_name: str, reason: str, escalation: Optional[dict]) -> dict[str, Any]:
-            return x_router_meta(
-                request_id=request_id,
-                session_id=session.session_id,
-                task_id=task_id,
-                tier=tier,
-                backend_name=backend_name,
-                reason=reason,
-                escalation=escalation,
-            )
-
-        # -- cloud gate for frontier (PRD §21/§22) ------------------------------
-        if decision.tier == "frontier":
-            allowed, why = cloud.allows(manual=decision.manual)
-            if not allowed:
-                M["cloud_blocked_total"].inc(reason=why or "unknown")
-                x_router = _meta(
-                    "frontier", backends["frontier"].name, decision.reason,
-                    {"required": True, "to": "frontier", "reason": why},
-                )
-                resp_body = build_escalation_required(
-                    request_id=request_id, model_alias=body.get("model"), x_router=x_router
-                )
-                _finish(request_id, session.session_id, task_id, "frontier", backends["frontier"].name, t0, 200)
-                return JSONResponse(status_code=200, content=resp_body)
-
-        # -- dispatch with backend fallback (PRD §31; NOT an escalation) --------
-        result: Optional[BackendResult] = None
-        serving: Optional[Backend] = None
-        last_error: Optional[BackendError] = None
-        for candidate in _candidates(decision.tier):
-            M["backend_requests_total"].inc(backend=candidate.name)
-            if candidate.tier == "frontier":
-                M["cloud_requests_total"].inc()
-            try:
-                result = await candidate.chat_completion(body, stream=stream)
-                serving = candidate
-                break
-            except BackendError as e:
-                last_error = e
-                M["backend_errors_total"].inc(backend=candidate.name, kind=e.kind)
-                log.warning("backend %s failed (kind=%s): %s", candidate.name, e.kind, e)
-
-        if result is None or serving is None:
-            assert last_error is not None
-            store.mark_error(session, str(last_error))
-            _note_request_failure(session, task, serving_tier=decision.tier, manual=decision.manual, kind=last_error.kind)
-            x_router = _meta(decision.tier, backends[decision.tier].name, "backend_unavailable", esc_dict)
-            M["requests_total"].inc(route=decision.tier, status="error")
-            M["request_latency_seconds"].observe(time.perf_counter() - t0, route=decision.tier)
+        if outcome["kind"] == "error":
+            M["requests_total"].inc(route=outcome["tier"], status="error")
+            M["request_latency_seconds"].observe(time.perf_counter() - t0, route=outcome["tier"])
             return JSONResponse(
                 status_code=502,
-                content={**error_body(f"backend '{decision.tier}' unavailable: {last_error}", "backend_error"), "x_router": x_router},
+                content={**error_body(outcome["message"], "backend_error"), "x_router": outcome["x_router"]},
             )
 
-        # A non-2xx from the backend (e.g. 400) is forwarded to the client; if
-        # the backend_error signal is enabled it also counts toward rule D.
-        if result.status_code >= 400:
-            _note_request_failure(session, task, serving_tier=serving.tier, manual=decision.manual, kind="backend_error")
-
-        store.record_request(session, task, serving.tier, serving.name)
+        result: BackendResult = outcome["result"]
+        serving: Backend = outcome["serving"]
+        x_router = outcome["x_router"]
 
         # -- response -----------------------------------------------------------
-        served_reason = decision.reason if serving.tier == decision.tier else "backend_fallback"
-        x_router = _meta(serving.tier, serving.name, served_reason, esc_dict)
         latency = time.perf_counter() - t0
 
         # A backend may answer a streaming request with a plain (non-2xx) JSON
@@ -285,7 +377,7 @@ def create_app(cfg: AppConfig) -> FastAPI:
 
             M["requests_total"].inc(route=serving.tier, status="ok")
             M["request_latency_seconds"].observe(latency, route=serving.tier)
-            _finish(request_id, session.session_id, task_id, serving.tier, serving.name, t0, 200)
+            _finish(request_id, outcome["session_id"], outcome["task_id"], serving.tier, serving.name, t0, 200)
             return StreamingResponse(
                 gen(),
                 media_type="text/event-stream",
@@ -311,7 +403,124 @@ def create_app(cfg: AppConfig) -> FastAPI:
 
         M["requests_total"].inc(route=serving.tier, status="ok" if status_code < 400 else "error")
         M["request_latency_seconds"].observe(latency, route=serving.tier)
-        _finish(request_id, session.session_id, task_id, serving.tier, serving.name, t0, status_code)
+        _finish(request_id, outcome["session_id"], outcome["task_id"], serving.tier, serving.name, t0, status_code)
+
+        return Response(content=out_bytes, status_code=status_code, media_type="application/json")
+
+    # ------------------------------------------------------------------ messages (Anthropic)
+
+    @app.post("/v1/messages")
+    async def create_message(request: Request) -> Response:
+        """Anthropic Messages API for Claude Code (PRD §51).
+
+        Translates the request to OpenAI chat-completions, runs it through the
+        same routing/escalation machinery as /v1/chat/completions, and
+        translates the response back — including the streaming event protocol.
+        """
+        request_id = uuid.uuid4().hex[:8]
+        lc_headers = {k.lower(): v for k, v in request.headers.items()}
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content=anthropic_error("request body must be valid JSON"))
+        if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
+            return JSONResponse(
+                status_code=400,
+                content=anthropic_error("'messages' (a non-empty list) is required"),
+            )
+
+        t0 = time.perf_counter()
+        stream = bool(body.get("stream", False))
+        openai_body = to_openai_request(body)
+        thinking = wants_thinking(body)
+        model_alias = body.get("model") or "auto"
+
+        outcome = await _dispatch(request_id=request_id, lc_headers=lc_headers, openai_body=openai_body, stream=stream)
+
+        if outcome["kind"] == "unknown_model":
+            return JSONResponse(
+                status_code=404,
+                content=anthropic_error(
+                    f"unknown model {outcome['model']!r}; expected one of auto|local-fast|local-deep|frontier",
+                    "model_not_found",
+                ),
+            )
+
+        if outcome["kind"] == "escalation":
+            x_router = outcome["x_router"]
+            resp_body = build_escalation_required_message(
+                request_id=request_id, model_alias=body.get("model"), x_router=x_router
+            )
+            _finish(request_id, outcome["session_id"], outcome["task_id"], "frontier", backends["frontier"].name, t0, 200)
+            return JSONResponse(status_code=200, content=resp_body)
+
+        if outcome["kind"] == "error":
+            M["requests_total"].inc(route=outcome["tier"], status="error")
+            M["request_latency_seconds"].observe(time.perf_counter() - t0, route=outcome["tier"])
+            return JSONResponse(
+                status_code=502,
+                content={**anthropic_error(outcome["message"], "backend_error"), "x_router": outcome["x_router"]},
+            )
+
+        result: BackendResult = outcome["result"]
+        serving: Backend = outcome["serving"]
+        x_router = outcome["x_router"]
+        latency = time.perf_counter() - t0
+
+        # A backend may answer a streaming request with a plain (non-2xx) JSON
+        # body; in that case result.stream is None and we fall through to the
+        # non-streaming rendering below.
+        if stream and result.stream is not None:
+            est_input = estimate_prompt_tokens(openai_body, cfg.routing.context.chars_per_token)
+
+            async def gen() -> AsyncIterator[bytes]:
+                async for frame in anthropic_stream(
+                    result.stream,  # type: ignore[arg-type]
+                    model_alias=model_alias,
+                    thinking=thinking,
+                    estimated_input_tokens=est_input,
+                    x_router=x_router,
+                ):
+                    yield frame.encode("utf-8")
+
+            M["requests_total"].inc(route=serving.tier, status="ok")
+            M["request_latency_seconds"].observe(latency, route=serving.tier)
+            _finish(request_id, outcome["session_id"], outcome["task_id"], serving.tier, serving.name, t0, 200)
+            return StreamingResponse(
+                gen(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # Non-streaming rendering.
+        if serving.tier == "frontier":
+            cloud.record(result.usage)  # count rate/cost for this request now
+        status_code = result.status_code
+        try:
+            data = json.loads(result.body or b"{}")
+        except (ValueError, UnicodeDecodeError):
+            data = None
+
+        if isinstance(data, dict) and isinstance(data.get("choices"), list):
+            out = to_anthropic_message(data, model_alias=model_alias, thinking=thinking)
+            out["x_router"] = x_router
+            out_bytes = json.dumps(out).encode()
+        else:  # backend error body (or non-JSON) -> Anthropic error envelope
+            err = data.get("error") if isinstance(data, dict) else None
+            message = (
+                err.get("message")
+                if isinstance(err, dict) and isinstance(err.get("message"), str)
+                else f"backend error (HTTP {status_code})"
+            )
+            out_bytes = json.dumps({**anthropic_error(message), "x_router": x_router}).encode()
+
+        if cfg.logging.log_responses and status_code == 200:
+            log.debug("response body=%s", out_bytes[:2000].decode("utf-8", "replace"))
+
+        M["requests_total"].inc(route=serving.tier, status="ok" if status_code < 400 else "error")
+        M["request_latency_seconds"].observe(latency, route=serving.tier)
+        _finish(request_id, outcome["session_id"], outcome["task_id"], serving.tier, serving.name, t0, status_code)
 
         return Response(content=out_bytes, status_code=status_code, media_type="application/json")
 

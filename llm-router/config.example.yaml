@@ -19,6 +19,10 @@ backends:
     model: "local-fast"           # the real model name to send to this backend
     timeout_seconds: 300
     max_context: 32768            # hard ctx window of this model (prompt + completion)
+    query_context_size: false     # true = ask the backend at startup for its real
+                                  # context size and use that instead (llama-server
+                                  # reports it via GET /props; PRD §52). A failed
+                                  # query keeps max_context.
 
   deep:
     type: "openai_compatible"     # llama-server :8002 (dual GPU)

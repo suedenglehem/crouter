@@ -12,11 +12,11 @@ The router itself never depends on CLAUDE.md (PRD §16): the policy is a behavio
 
 ## 1. Routing Claude Code at the router
 
-Claude Code speaks the Anthropic Messages API; llm-router speaks OpenAI-compatible. Two options:
+Claude Code speaks the Anthropic Messages API; llm-router now serves both that and OpenAI-compatible (PRD §51). Two options:
 
 ### Option A — subagent/shell routing (zero extra dependencies)
 
-Keep your normal Claude Code setup and let it call the router for work through Bash. This is the recommended v1 mode and matches the PRD's subagent-friendly design (§28):
+Keep your normal Claude Code setup and let it call the router for work through Bash. This matches the PRD's subagent-friendly design (§28):
 
 ```bash
 # routine request on the fast tier
@@ -28,15 +28,19 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 ./escalation.sh --route deep --prompt "explain why this test fails"
 ```
 
-### Option B — full translation proxy
+### Option B — run Claude Code through the router directly (built-in translator)
 
-Run an OpenAI→Anthropic translator in front of Claude Code (e.g. `claude-code-router`, LiteLLM, or any Messages-API shim) with its upstream pointed at `http://127.0.0.1:8000/v1` and model name `auto`. Then the *entire* main-agent loop runs through the router, including streaming and tool calls (both are proxied transparently).
+Point `ANTHROPIC_BASE_URL` at the router: its `POST /v1/messages` endpoint translates Anthropic <-> OpenAI, so the *entire* main-agent loop runs through routing/escalation — streaming, tool calls and usage included. No external proxy needed.
 
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:<proxy-port>   # per your proxy's docs
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_API_KEY=local
+claude --model auto        # or local-fast / local-deep / frontier
 ```
 
-Whichever option you pick, set a stable session/task identity so escalation state works:
+`auto` is not in Claude Code's built-in model catalog, so set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to your real window (e.g. the deep tier's) — that silences the unknown-model notice and sizes auto-compact correctly. Session identity works out of the box: the router falls back to Claude Code's own `X-Claude-Code-Session-ID` header when `X-LLM-Session-ID` is absent.
+
+Whichever option you pick, a stable session/task identity keeps escalation state coherent:
 
 - `X-LLM-Session-ID` — one value per Claude Code conversation (e.g. the session UUID).
 - `X-LLM-Task-ID` — one value per user task/subtask; change it when starting a new unit of work so an escalated old task doesn't drag new work to a stronger model.

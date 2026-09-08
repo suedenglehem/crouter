@@ -63,6 +63,12 @@ class Backend(abc.ABC):
     async def close(self) -> None:  # pragma: no cover - trivial default
         pass
 
+    async def query_context_size(self) -> Optional[int]:
+        """The backend's real context window (PRD §52), or ``None`` when it
+        doesn't report one. Used to override a possibly-stale manual
+        ``max_context`` at startup."""
+        return None
+
 
 def cached_health(
     last: Optional[tuple[float, bool, float]], interval_seconds: float

@@ -53,6 +53,38 @@ class OpenAICompatibleBackend(Backend):
             payload["model"] = self._cfg.model
         return payload
 
+    async def query_context_size(self) -> Optional[int]:
+        """llama-server reports its effective context size at GET /props —
+        ``default_generation_settings.n_ctx`` is the --ctx-size actually in
+        use (or the model's own limit when none was given). It serves /props
+        at the server *root*, outside the OpenAI-compatible /v1 prefix, so we
+        try that first and fall back to a path under base_url. Non-llama
+        servers usually lack it; that yields ``None`` and the manual config
+        value stands."""
+        urls: list[str] = []
+        base = (self._cfg.base_url or "").rstrip("/")
+        if base.endswith("/v1"):
+            # llama-server serves /props at the server *root*, outside the
+            # OpenAI-compatible /v1 prefix — strip it to get there.
+            urls.append(base[: -len("/v1")] + "/props")
+        urls.append("/props")  # relative to base_url (.../v1/props)
+        for url in dict.fromkeys(urls):
+            try:
+                resp = await self._client.get(url)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                continue
+            n_ctx = (data.get("default_generation_settings") or {}).get("n_ctx")
+            if isinstance(n_ctx, bool) or not isinstance(n_ctx, (int, float)) or n_ctx <= 0:
+                return None
+            return int(n_ctx)
+        return None
+
     async def chat_completion(self, body: dict[str, Any], *, stream: bool) -> BackendResult:
         payload = self._payload(body)
         headers = self._request_headers() or None

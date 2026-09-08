@@ -1757,3 +1757,32 @@ with:
 The implementation should be understandable by one developer and easy to modify.
 
 Do not add functionality that is not required by this specification.
+# 51. Anthropic Messages API Endpoint (Claude Code Direct)
+
+Claude Code speaks the Anthropic Messages API, not OpenAI chat-completions. To run the *entire* Claude Code agent loop through the router (not just subagent/shell calls), the router serves a second endpoint:
+
+```text
+POST /v1/messages    Anthropic Messages API (streaming + non-streaming)
+```
+
+Behavior:
+
+- The request is translated Anthropic -> OpenAI before routing: top-level `system` (string or text-block list) becomes one system message; assistant `tool_use` blocks become OpenAI `tool_calls`; user `tool_result` blocks become `role:"tool"` messages; mid-conversation `role:"system"` messages pass through. Unknown fields (`metadata`, `output_config`, `thinking`, `context_management`, ...) are dropped, never fatal — Claude Code ships new betas faster than the router ships releases.
+- Routing, escalation, context floor, cloud gate, fallbacks and metrics are identical to `/v1/chat/completions` (shared dispatch). The translated body is what backends receive; `model` is rewritten as usual.
+- Responses translate back: non-streaming completions become Anthropic message objects (`content` blocks for text / thinking / tool_use, mapped `stop_reason`, `usage` from prompt/completion tokens); streaming becomes the Anthropic SSE event protocol (`message_start`, `content_block_*`, `message_delta`, `message_stop`).
+- Token accounting: the router requests real usage from llama.cpp via `stream_options.include_usage`. `message_start.usage.input_tokens` carries a chars-per-token seed estimate (the real count only exists at stream end); `message_delta.usage` carries the real prompt/completion counts. Claude Code re-estimates every turn, so the seed is only for first-paint accuracy.
+- Model reasoning (`reasoning_content`) becomes a `thinking` content block only when the request carried a `thinking` parameter; otherwise it is dropped.
+- Session identity: `X-LLM-Session-ID` as before, with fallback to Claude Code's own `X-Claude-Code-Session-ID` header so escalation state works without extra client configuration.
+- Errors use the Anthropic envelope (`{"type":"error","error":{...}}`): unknown model -> 404, all backends down -> 502, backend non-2xx forwarded with its status. The cloud-gate sentinel is a valid Anthropic message whose text starts `[llm-router] escalation required:` (HTTP 200), mirroring the OpenAI-shaped one from §21.
+- `x_router` metadata: top-level key in non-streaming bodies; inside `message_start.message` for streams.
+
+Client-side note: model names like `auto` are not in Claude Code's built-in catalog, so clients should set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real window of the tier they expect (silences the unknown-model notice and sizes auto-compact).
+
+# 52. Queried Context Sizes (`query_context_size`)
+
+A manual `max_context` in config can go stale whenever a server is restarted with different arguments (or was written down wrong in the first place — on this deployment both configured values were off by tens of tokens from reality). Backends may therefore report their real window:
+
+- **Config**: per-backend boolean `query_context_size` (default `false`).
+- **Mechanism**: at startup, for each flagged backend the router calls `Backend.query_context_size()`. The OpenAI-compatible implementation issues `GET /props` and reads `default_generation_settings.n_ctx` — llama-server's *effective* context size (the `--ctx-size` actually in use, or the model's own limit when none was given).
+- **Override semantics**: a successful query replaces `max_context` for that backend (logged: `using queried context size N (config had M)`); the context floor (§33) then uses the real value. A failed query — no `/props`, non-200, bad JSON, missing/invalid `n_ctx` — keeps the manual config value and logs a warning.
+- **Scope**: startup-time only; no per-request polling. Non-llama backends (e.g. OpenRouter) inherit the base default (`None`) and simply keep their configured value unless they implement the method.
