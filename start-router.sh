@@ -1,1 +1,1 @@
-/dd2/andrei/crouter/daemon/start-router_local.sh
+/dd2/andrei/crouter/daemon/start-router_i7.sh
