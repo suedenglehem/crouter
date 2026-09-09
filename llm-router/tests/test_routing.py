@@ -48,6 +48,27 @@ def test_unknown_model_404(client):
     assert r.json()["error"]["type"] == "model_not_found"
 
 
+def test_claude_family_names_map_to_tiers(client):
+    # Claude Code background tasks (e.g. the auto-mode Bash safety classifier)
+    # send their own model names; they must not 404 or every gated command is
+    # blocked with "classifier unavailable".
+    r = chat(client, model="claude-sonnet-5")
+    assert r.status_code == 200
+    assert content_of(r) == "DEEP-SAYS-HI"
+    meta = r.json()["x_router"]
+    assert meta["route"] == "deep"
+    assert meta["reason"] == "claude_family"
+
+
+def test_claude_haiku_maps_to_fast(client):
+    r = chat(client, model="claude-haiku-4-5")
+    assert r.status_code == 200
+    assert content_of(r) == "FAST-SAYS-HI"
+    meta = r.json()["x_router"]
+    assert meta["route"] == "fast"
+    assert meta["reason"] == "claude_family"
+
+
 def test_route_header_wins_over_model(client):
     # Priority: explicit header (1) beats explicit model (2).
     r = chat(client, model="local-fast", **{"X-LLM-Route": "deep"})

@@ -52,6 +52,9 @@ ALIAS_TO_TIER = {
 REASON_EXPLICIT_ESCALATE = "explicit_escalate"
 REASON_EXPLICIT_ROUTE_HEADER = "explicit_route_header"
 REASON_EXPLICIT_MODEL = "explicit_model"
+#: A Claude Code background task (safety classifier, context collapse, ...)
+#: sent its own model name; mapped to a tier by family.
+REASON_CLAUDE_FAMILY = "claude_family"
 REASON_AUTO_POLICY = "auto_policy"
 REASON_DEFAULT = "default"
 #: The request's estimated context exceeds the selected tier's max_context.
@@ -149,6 +152,19 @@ class Router:
         # event-driven escalation) — this is where session state matters.
         if m == "auto" or h_route == "auto":
             return RouteDecision(tier=task.current_route, reason=REASON_AUTO_POLICY)
+
+        # 5. Claude Code background tasks (Bash safety classifier, context
+        # collapse, small-fast helpers) send their own model names — e.g. the
+        # auto-mode classifier sends claude-sonnet-5 regardless of what the
+        # user runs CC with. Without a mapping they 404 and every gated Bash
+        # command is blocked ("classifier unavailable"). Map by family:
+        # haiku -> fast, everything else -> deep (falling back to fast when
+        # the config has no deep tier).
+        if m.startswith("claude"):
+            candidates = ("fast",) if "haiku" in m else ("deep", "fast")
+            for tier in candidates:
+                if tier in self._cfg.backends:
+                    return RouteDecision(tier=tier, reason=REASON_CLAUDE_FAMILY, manual=True)
 
         raise UnknownModel(m)
 
