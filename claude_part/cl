@@ -6,7 +6,14 @@ nl=`ps aux | grep llm-router | wc -l`
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 export ANTHROPIC_API_KEY=local
 
+# CC 2.1.x auto-compact threshold = window - min(max_output, 20k) - 13k.
+# This install's baseline (system prompt + tool defs + MCP tools) is ~40k
+# tokens, so the threshold must sit well above that or CC compacts every
+# turn and thrashes. 120k -> threshold ~87k; worst-case request at compact
+# time = 87k input + 80k max_output = 167k < deep ctx (172.8k). Turns whose
+# estimated size exceeds fast's ctx are bumped to deep by the router floor.
+
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS=80000
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS=70000
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=120000
 
 $HOME/.local/bin/claude --model auto $@
