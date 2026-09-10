@@ -2,3 +2,6 @@
 .claude/
 .resume
 tmp/
+
+# Design spec — kept locally only, not tracked on GitHub
+prd/
