@@ -133,6 +133,27 @@ Notes:
 - The model name `auto` is not in Claude Code's built-in catalog; set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to your real window (e.g. the deep tier's) to silence the unknown-model notice and size auto-compact correctly.
 - Real prompt/completion token counts are requested from llama.cpp (`stream_options.include_usage`) and reported in `message_delta.usage`; `message_start` carries a chars-per-token estimate as its seed.
 
+**Sizing `CLAUDE_CODE_MAX_CONTEXT_TOKENS` / `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.**
+Claude Code's auto-compact threshold is `window − min(MAX_OUTPUT, 20k) − 13k` (verified in CC 2.1.x). Two constraints determine the right values:
+
+1. The threshold must sit **well above the session baseline** — system prompt + tool definitions + MCP tools (~45k tokens on a typical install), or CC compacts every turn and thrashes ("Autocompact is thrashing… refilled to limit within 3 turns").
+2. The **worst-case request at compact time** — threshold input + `MAX_OUTPUT` — must fit the biggest local tier's context window, or that turn gets an "escalation required" response / backend overflow instead of a clean compact.
+
+Recommended for a fast(132k)/deep(172k) setup (as used by `claude_part/cl` and `/usr/local/bin/cl2`):
+
+```bash
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=140000   # threshold = 140k - 20k - 13k = 107k
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536     # worst case at compact ~= 172.5k <= deep ctx
+```
+
+Why these values:
+
+- **140k window** → threshold 107k, comfortably above the ~45k baseline (no thrashing), while keeping long sessions from outgrowing every local tier before they compact — a 256k window would let input reach ~223k, past even deep's ctx.
+- **65536 output** matches `routing.context.max_completion_reserve`, so CC's per-request output budget equals what the router reserves when routing — no mid-generation overflow past a tier's window. Any value ≥ 20k yields the *same* compact threshold (the formula caps the subtraction at 20k), so lowering it from a huge value changes nothing about compaction; it only shrinks the per-request `max_tokens` CC sends.
+- If the fast thinking model over-deliberates on tool round-trips, drop `MAX_OUTPUT` to ~32768 — still above the 20k cap (threshold unchanged) and more headroom on fast.
+
+The variables are read at Claude Code launch, so they belong in your launcher script; a running session keeps its old values until restarted.
+
 ## Automatic routing & escalation
 
 `auto` always starts on `routing.default` (`fast`). It escalates only on **deterministic signals** — no LLM is invoked to judge difficulty, and the model never has to know it's struggling:
