@@ -5,12 +5,26 @@ chk_llm_router=1
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 export ANTHROPIC_API_KEY=local
 
-# CC 2.1.x auto-compact threshold = window - min(max_output, 20k) - 13k.
-# This install's baseline (system prompt + tool defs + MCP tools) is ~40k
-# tokens, so the threshold must sit well above that or CC compacts every
-# turn and thrashes. 120k -> threshold ~87k; worst-case request at compact
-# time = 87k input + 80k max_output = 167k < deep ctx (172.8k). Turns whose
-# estimated size exceeds fast's ctx are bumped to deep by the router floor.
+# Why these two values (CC 2.1.x, this install: fast ctx ~132.8k, deep ctx ~172.8k):
+#
+# CC's auto-compact threshold = window - min(MAX_OUTPUT, 20k) - 13k.
+# Two constraints pin the values:
+#   1. The threshold must sit well above this install's session baseline
+#      (~45k tokens: system prompt + tool defs + MCP tools), or CC compacts
+#      every turn and thrashes. 140000 -> threshold = 140k - 20k - 13k = 107k.
+#   2. The worst-case request at compact time (threshold input + MAX_OUTPUT)
+#      must fit the biggest local tier, or that turn overflows to "escalation
+#      required" instead of a clean compact: 107k + 65536 ~= 172.5k <= deep ctx.
+#
+# Any MAX_OUTPUT >= 20k gives the SAME threshold (the formula clamps at 20k),
+# so it does not affect compact timing — pick it for consistency with the
+# router instead: config_i7.yaml caps routing.context.max_completion_reserve
+# at 65536, and CC fills max_tokens up to MAX_OUTPUT on every request. With
+# both equal, a fresh turn estimates ~45k + 65k ~= 110k < fast ctx -> stays
+# on the cheap model; only genuinely large conversations are bumped to deep
+# by the router's context floor (x_router.reason: context_overflow).
+# If the fast thinking model over-deliberates, drop MAX_OUTPUT to ~32768 —
+# threshold unchanged, worst case at compact drops to ~140k.
 
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS=140000
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536

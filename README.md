@@ -107,9 +107,19 @@ nl=`ps aux | grep llm-router | wc -l`
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000   # the router, not api.anthropic.com
 export ANTHROPIC_API_KEY=local                     # any non-empty value; the router doesn't check it
 
-# Window sizing — see "Context settings" below for why these exact values
-export CLAUDE_CODE_MAX_OUTPUT_TOKENS=32000
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS=70000
+# Window sizing — full reasoning in claude_part/cl (the tracked launcher):
+# CC 2.1.x auto-compact threshold = window - min(MAX_OUTPUT, 20k) - 13k.
+#   * 140000 -> threshold 107k, well above this install's ~45k session
+#     baseline (system + tools + MCP), so CC doesn't compact every turn.
+#   * worst case at compact time = 107k input + 65536 output ~= 172.5k,
+#     which still fits deep's ctx (~172.8k) — no spurious "escalation required".
+#   * any MAX_OUTPUT >= 20k gives the SAME threshold (formula clamps at 20k),
+#     so 65536 is chosen to match the router's max_completion_reserve cap:
+#     CC fills max_tokens up to it on every request, and with both equal a
+#     fresh turn estimates ~45k + 65k ~= 110k < fast ctx -> stays on fast;
+#     only genuinely large conversations bump to deep (context_overflow).
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=140000
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536
 
 exec $HOME/.local/bin/claude --model auto "$@"
 ```
@@ -118,7 +128,7 @@ exec $HOME/.local/bin/claude --model auto "$@"
 
 - **`ANTHROPIC_BASE_URL`** — the whole agent loop (streaming SSE, tool calls, thinking blocks, usage) goes to the router's `/v1/messages`, which translates Anthropic ↔ OpenAI in both directions. Session identity works out of the box: the router falls back to Claude Code's own `X-Claude-Code-Session-ID` header, so escalation tracking needs no extra config.
 - **`--model auto`** — not in Claude Code's built-in model catalog; that's fine, but you must set **`CLAUDE_CODE_MAX_CONTEXT_TOKENS`** to a real window size: it silences the unknown-model notice, sizes auto-compact correctly, and (because Claude Code fills `max_tokens` up to it) it *is* roughly the routing threshold — see the table in the next section.
-- **`CLAUDE_CODE_MAX_OUTPUT_TOKENS=32000`** — keep ≤ 32k: the fast tier is a thinking model and over-deliberates with bigger generation budgets.
+- **`CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536`** — matches the router's `max_completion_reserve` cap so CC's per-request budget equals what the router reserves when deciding tiers (see "Context settings" below). Drop to ~32768 if the fast thinking model over-deliberates with a large generation budget.
 
 ### 2. Steering slash commands (recommended)
 
@@ -156,21 +166,22 @@ grep "route=" /tmp/llm-router.log | tail    # expect route=fast backend=local-fa
 
 `/usr/local/bin/cl` points `ANTHROPIC_BASE_URL=http://127.0.0.1:8000` and runs `claude --model auto`. The router's native Anthropic endpoint (`POST /v1/messages`, PRD §51) translates both directions — streaming SSE, tool calls, thinking blocks, real usage included. Session identity falls back to Claude Code's own `X-Claude-Code-Session-ID` header, so escalation tracking works with no extra config.
 
-### Context settings (measured on this hardware, 2026-09-08)
+### Context settings (measured on this hardware, updated 2026-09-10)
 
-How routing interacts with your env vars: Claude Code sizes each request's `max_tokens` to fill `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. The router's context floor then estimates the request as **prompt chars / 3 + max_tokens** and bumps it up the tier chain until a backend's `max_context` fits. So the window you configure *is* roughly the routing threshold:
+How routing interacts with your env vars: Claude Code fills each request's `max_tokens` up to `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, and the router's context floor estimates the request as **prompt chars / 3 + min(max_tokens, max_completion_reserve)** — config_i7.yaml caps that term at 65536 — then bumps it up the tier chain until a backend's `max_context` fits. CC's auto-compact threshold is `window − min(MAX_OUTPUT, 20k) − 13k`, so two constraints pin the values:
 
-| cl settings | estimated need | where requests land |
-|---|---|---|
-| `MAX_CONTEXT=172000`, `MAX_OUTPUT=172000` | ~170k | **always deep** (over fast's 132768) |
-| `MAX_CONTEXT=100000`, `MAX_OUTPUT=100000` | ~135–143k | **always deep** — over by a hair, grows with the conversation |
-| `MAX_CONTEXT=70000`, `MAX_OUTPUT=80000` | ~66–78k + 67k budget | fast ✓ routing-wise, but see below |
-| **`MAX_CONTEXT=70000`, `MAX_OUTPUT=32000`** ← recommended | ~66–78k | **fast**, with margin; long conversations still bump to deep automatically |
+| cl settings | compact threshold | worst case at compact time | where fresh turns land |
+|---|---|---|---|
+| `MAX_CONTEXT=70000` (old default) | ~37k | — | **below** this install's ~45k session baseline → CC compacts every turn and thrashes |
+| **`MAX_CONTEXT=140000`, `MAX_OUTPUT=65536`** ← recommended | 107k | ≈ 172.5k ≤ deep ctx (~172.8k) | ~110k estimated → **fast**; long conversations bump to deep automatically (`context_overflow`) |
+| `MAX_CONTEXT=172000`, `MAX_OUTPUT=65536` | ~139k | ≈ 204k > deep ctx | risks "escalation required" at compact time instead of a clean compact |
 
 Two findings that shaped the recommendation:
 
-1. **Keep `CLAUDE_CODE_MAX_OUTPUT_TOKENS` ≤ 32000.** The fast model is a *thinking* model (`reasoning_content`). With a ~67k generation budget it over-deliberates — observed asking for clarification instead of acting on trivial tool tasks. At a 32k cap it just acts, and 32k per response is far more than an agent turn needs.
-2. **Don't set the window to match deep's context.** That defeats tiering: every request estimates above fast's limit and "routine" work silently runs on the 27B. Size the window for *fast* (≤ ~100k, recommended 70k); genuinely big conversations get bumped to deep by the floor anyway (`x_router.reason: context_overflow`, logged as `CONTEXT-OVERFLOW`).
+1. **`MAX_OUTPUT` doesn't change compact timing once it's ≥ 20k** (the threshold formula clamps there) — so pick it for routing consistency, not compaction: matching the router's `max_completion_reserve` cap means CC's per-request budget equals what the router reserves when deciding tiers. A fresh turn then estimates ~45k + 65k ≈ 110k < fast ctx and stays on the cheap model; only genuinely large conversations bump to deep.
+2. **Don't set `MAX_CONTEXT` to match deep's context.** That defeats tiering: every request estimates above fast's limit and "routine" work silently runs on the 27B. Size it so fresh turns stay under fast's window (140k does, via the cap); genuinely big conversations get bumped by the floor anyway (`x_router.reason: context_overflow`, logged as `CONTEXT-OVERFLOW`).
+
+If the fast thinking model over-deliberates with a large generation budget, drop `MAX_OUTPUT` to ~32768 — threshold unchanged (still clamped at 20k), worst case at compact drops to ≈ 140k.
 
 Sanity check after changing settings — run a tool round-trip and confirm routing in the log:
 
