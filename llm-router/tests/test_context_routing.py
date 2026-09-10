@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from conftest import content_of, make_config
 from router.api import create_app
-from router.context import required_context
+from router.context import estimate_prompt_tokens, required_context
 from router.config import ContextRoutingConfig
 
 
@@ -118,6 +118,27 @@ def test_client_max_tokens_counts_toward_requirement():
 
 # -- config switches -----------------------------------------------------------
 
+def test_cap_keeps_chatty_client_on_fast():
+    # Claude Code sends a large max_tokens on every request; the cap keeps that
+    # upper bound from pushing trivial turns past small tiers' windows.
+    with _ctx_client(
+        routing={
+            "context": {
+                "enabled": True,
+                "chars_per_token": 3.0,
+                "completion_reserve": 50,
+                "max_completion_reserve": 100,
+            }
+        }
+    ) as c:
+        body = {"model": "auto", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 9000}
+        r = c.post("/v1/chat/completions", json=body)
+        assert content_of(r) == "FAST-SAYS-HI"
+        meta = r.json()["x_router"]
+        assert meta["route"] == "fast"
+        assert meta["reason"] == "auto_policy"
+
+
 def test_disabled_context_routing_never_bumps():
     with _ctx_client(routing={"context": {"enabled": False}}) as c:
         r = _post(c, "a" * 40_000)
@@ -198,3 +219,29 @@ def test_required_context_honors_generation_caps():
     # max_completion_tokens is honored too.
     alt_cap = required_context({**base, "max_completion_tokens": 7}, cfg)
     assert alt_cap < no_cap
+
+
+def test_required_context_max_completion_reserve():
+    def est(body):
+        # Exactly the prompt term required_context() computes for this body.
+        return estimate_prompt_tokens(body, 4.0)
+
+    base_body = {"messages": [{"role": "user", "content": "x" * 40}]}
+    big_body = {**base_body, "max_tokens": 500}
+    small_body = {**base_body, "max_tokens": 50}
+
+    uncapped_cfg = ContextRoutingConfig(chars_per_token=4.0, completion_reserve=100)
+    assert required_context(big_body, uncapped_cfg) == est(big_body) + 500
+
+    capped_cfg = ContextRoutingConfig(
+        chars_per_token=4.0, completion_reserve=100, max_completion_reserve=200
+    )
+    # A big client cap is lowered to the reserve cap...
+    assert required_context(big_body, capped_cfg) == est(big_body) + 200
+    # ...a smaller explicit cap passes through unchanged...
+    assert required_context(small_body, capped_cfg) == est(small_body) + 50
+    # ...and the reserve itself is capped too.
+    big_reserve = ContextRoutingConfig(
+        chars_per_token=4.0, completion_reserve=500, max_completion_reserve=200
+    )
+    assert required_context(base_body, big_reserve) == est(base_body) + 200

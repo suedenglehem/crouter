@@ -54,6 +54,24 @@ routing:
     enabled: true
     chars_per_token: 3.0          # conservative divisor for the serialized body
     completion_reserve: 8192      # headroom when the client gives no max_tokens
+    max_completion_reserve: null  # cap on the completion term (client max_tokens or
+                                  # the reserve). Clients like Claude Code send a large
+                                  # max_tokens on every request — an upper bound, not a
+                                  # requirement; set e.g. 65536 so one chatty client
+                                  # can't push every turn past small tiers' windows.
+
+  # Optional difficulty classification before routing (PRD §20 opt-in): plain
+  # auto requests are judged once per user message by the configured tier,
+  # which must answer exactly "FAST" or "DEEP". Advisory — any failure
+  # (timeout, error, unparseable) falls back to normal auto policy.
+  complexity:
+    enabled: false                # off by default; opt in per deployment
+    tier: fast                    # judging backend (usually the cheap one)
+    timeout_seconds: 10           # per judge call; expiry -> auto policy
+    max_input_chars: 2000         # user message truncated to this before judging
+    cache_size: 256               # LRU of (session, message-hash) verdicts
+    disable_thinking: true        # send enable_thinking=false (Qwen3 llama.cpp);
+                                  # servers ignoring unknown fields just think anyway
 
   # Backend-fallback policy (PRD §31). A *backend* failure (crash, 5xx,
   # timeout) is NOT a model-quality failure — it falls back here instead of

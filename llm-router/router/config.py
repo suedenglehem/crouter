@@ -131,6 +131,37 @@ class ContextRoutingConfig(BaseModel):
     #: Tokens reserved for the completion when the client gives no max_tokens
     #: (llama-server would otherwise generate until EOS or a full context).
     completion_reserve: int = Field(default=8192, ge=0)
+    #: Cap applied to the completion term — both an explicit client max_tokens
+    #: and ``completion_reserve``. Clients like Claude Code send a large
+    #: max_tokens on every request (an upper bound, not a requirement); without
+    #: a cap that alone pushes every turn past small tiers' windows.
+    #: ``None`` = trust the client (previous behavior).
+    max_completion_reserve: Optional[int] = Field(default=None, ge=0)
+
+
+class ComplexityConfig(BaseModel):
+    """Optional difficulty classification by an LLM before routing (PRD §20 opt-in).
+
+    When enabled, plain ``auto`` requests are judged once per user message by a
+    configured backend ("FAST" or "DEEP") and routed accordingly. The judge is
+    advisory: any failure degrades to the normal auto policy.
+    """
+
+    #: Off by default so existing configs/tests behave identically until opted in.
+    enabled: bool = False
+    #: Tier whose backend performs the judging (usually the cheap one).
+    tier: str = "fast"
+    #: Per-judge-call timeout; on expiry the request falls back to auto policy.
+    timeout_seconds: float = Field(default=10.0, gt=0)
+    #: The user message is truncated to this many characters before judging.
+    max_input_chars: int = Field(default=2000, ge=64)
+    #: LRU size for (session, message-hash) -> verdict; only successful
+    #: verdicts are cached so a busy judge can't pin "no verdict".
+    cache_size: int = Field(default=256, ge=1)
+    #: Send chat_template_kwargs={"enable_thinking": false} to the judge. Qwen3
+    #: llama.cpp servers honor it (skips reasoning tokens); servers that ignore
+    #: unknown fields just think anyway; a strict 400 degrades safely to "no verdict".
+    disable_thinking: bool = True
 
 
 class RoutingConfig(BaseModel):
@@ -143,6 +174,7 @@ class RoutingConfig(BaseModel):
     fallbacks: dict[str, list[str]] = Field(default_factory=dict)
     escalation: EscalationConfig = Field(default_factory=EscalationConfig)
     context: ContextRoutingConfig = Field(default_factory=ContextRoutingConfig)
+    complexity: ComplexityConfig = Field(default_factory=ComplexityConfig)
 
     @field_validator("default")
     @classmethod
@@ -235,6 +267,10 @@ def _cross_validate(cfg: AppConfig) -> None:
         for t in targets:
             if t not in cfg.backends:
                 raise ConfigError(f"fallback target {t!r} (of {src}) is not a configured backend")
+
+    cx = cfg.routing.complexity
+    if cx.enabled and cx.tier not in cfg.backends:
+        raise ConfigError(f"complexity tier references unknown backend {cx.tier!r}")
 
     for tier, bcfg in cfg.backends.items():
         if bcfg.type == "mock":

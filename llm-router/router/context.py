@@ -41,4 +41,10 @@ def required_context(body: dict[str, Any], cfg: ContextRoutingConfig) -> Optiona
     # Honor an explicit generation cap; otherwise reserve headroom so the model
     # can actually answer before the context fills up.
     completion = body.get("max_tokens") or body.get("max_completion_tokens") or cfg.completion_reserve
+    # A client's max_tokens is an upper bound, not a requirement — Claude Code
+    # sends its full output budget on every request. Cap the term so one chatty
+    # client can't push every turn past small tiers' windows (the cap only ever
+    # lowers it; small explicit caps pass through unchanged).
+    if cfg.max_completion_reserve is not None:
+        completion = min(int(completion), cfg.max_completion_reserve)
     return prompt + int(completion)

@@ -47,13 +47,22 @@ from .anthropic import (
 )
 from .backends import build_backends
 from .backends.base import Backend, BackendError, BackendResult
+from .complexity import ComplexityClassifier
 from .config import AppConfig
 from .context import estimate_prompt_tokens, required_context
 from .escalation import EscalationController
 from .events import handle_event
 from .metrics import MetricsRegistry, register_router_metrics
 from .models import EventIn, build_escalation_required, error_body, x_router_meta
-from .routing import ALIAS_TO_TIER, CloudBudget, REASON_CONTEXT_OVERFLOW, Router, UnknownModel
+from .routing import (
+    ALIAS_TO_TIER,
+    CloudBudget,
+    REASON_CONTEXT_OVERFLOW,
+    Router,
+    UnknownModel,
+    extract_prompt_marker,
+    last_user_message_text,
+)
 from .sessions import SessionState, SessionStore, TaskState
 
 log = logging.getLogger("router.api")
@@ -99,6 +108,9 @@ def create_app(cfg: AppConfig) -> FastAPI:
     registry = MetricsRegistry()
     M = register_router_metrics(registry)
     cloud = CloudBudget(cfg)
+    complexity_classifier: Optional[ComplexityClassifier] = (
+        ComplexityClassifier(cfg, backends) if cfg.routing.complexity.enabled else None
+    )
 
     # Effective max_context per tier as of startup — what ``/ctxlen/<tier>=reset``
     # restores. Seeded from the config and re-snapshotted after the
@@ -343,12 +355,38 @@ def create_app(cfg: AppConfig) -> FastAPI:
             log.debug("prompt messages=%d first=%r", len(openai_body["messages"]), str(openai_body["messages"][0])[:500])
 
         # -- route resolution (priority order, PRD §7 + context floor) ---------
+        # Prompt marker (@@fast / @@deep in the last user message): strip it
+        # before the size estimate so the context floor sees what is actually
+        # forwarded to the backend.
+        marker_tier = extract_prompt_marker(openai_body)
+        if marker_tier is not None:
+            log.info(
+                "PROMPT-MARKER request=%s session=%s task=%s tier=%s",
+                request_id, session.session_id, task.task_id, marker_tier,
+            )
+
+        # Complexity verdict (opt-in classifier): only for plain auto requests
+        # that will actually use it — never while pinned or when a marker,
+        # header or explicit model already decides the route.
+        complexity_tier = None
+        if (
+            complexity_classifier is not None
+            and route_state["pin"] is None
+            and marker_tier is None
+            and router.is_plain_auto(openai_body.get("model"), lc_headers)
+        ):
+            user_text = last_user_message_text(openai_body)
+            if user_text:
+                complexity_tier = await complexity_classifier.classify(session.session_id, user_text)
+
         required_ctx = required_context(openai_body, cfg.routing.context)
         try:
             decision = router.resolve(
                 model=openai_body.get("model"), headers=lc_headers, session=session, task=task,
                 required_context=required_ctx,
                 pinned_tier=route_state["pin"],
+                marker_tier=marker_tier,
+                complexity_tier=complexity_tier,
             )
         except UnknownModel as e:
             return {"kind": "unknown_model", "model": e.args[0], "session_id": session.session_id, "task_id": task_id}

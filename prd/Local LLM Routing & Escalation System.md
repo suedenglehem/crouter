@@ -308,10 +308,11 @@ activates automatic routing/escalation.
 Routing priority must be:
 
 ```text
-1. explicit escalation/control header
-2. explicit model
-3. session route
-4. automatic policy
+0. authoritative pin            (GET /route/all/<tier>)
+1. prompt marker                (@@fast / @@deep in the last user message)
+2. explicit escalation/control header
+3. explicit model
+4. automatic policy             (complexity verdict when enabled, else session route)
 5. configured default
 ```
 
@@ -331,6 +332,24 @@ deep
 frontier
 auto
 ```
+
+**Prompt markers.** A `@@fast`, `@@deep` or `@@frontier` token anywhere in the
+last user message steers that message's requests to the named tier (rightmost
+token wins) and is stripped before forwarding. It outranks headers and model
+names — the most recent human intent — but not an authoritative pin, and the
+context floor still applies afterwards. No session state changes: the next
+user message reverts to automatic routing. In Claude Code this means "per user
+message" in practice — the tool-loop requests of one turn all carry the same
+last user message, so a marker covers the whole agentic turn.
+
+**Complexity classifier (opt-in).** When `routing.complexity.enabled` is true,
+a plain auto request is judged once per user message by a configured backend
+that must answer exactly `FAST` or `DEEP`; the verdict feeds step 4 of the
+priority above. The judge is advisory — any failure falls back to the normal
+auto policy. This is a deliberate opt-in exception to §20 ("no LLM judges
+difficulty"): it adds one cheap local round trip per new user message in
+exchange for difficulty-aware routing, and verdicts are cached per
+(session, message hash).
 
 ---
 
@@ -375,6 +394,25 @@ backends:
 routing:
 
   default: "fast"
+
+  # Context floor: bump the tier up the chain until max_context fits the
+  # request (per-request, no state). The completion term is capped so a client
+  # that sends a large max_tokens on every request (e.g. Claude Code) cannot
+  # push every turn past small tiers' windows; null = trust the client.
+  context:
+    enabled: true
+    chars_per_token: 3.0
+    completion_reserve: 8192
+    max_completion_reserve: null
+
+  # Optional difficulty classification before routing (see §7). Off by default.
+  complexity:
+    enabled: false
+    tier: fast
+    timeout_seconds: 10
+    max_input_chars: 2000
+    cache_size: 256
+    disable_thinking: true
 
   escalation:
     enabled: true

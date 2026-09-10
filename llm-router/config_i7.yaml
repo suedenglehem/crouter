@@ -64,6 +64,21 @@ routing:
     enabled: true
     chars_per_token: 3.0           # conservative for code-heavy agent traffic
     completion_reserve: 8192       # headroom when client sends no max_tokens
+    max_completion_reserve: 65536  # cap on the completion term — Claude Code sends
+                                   # its full output budget (max_tokens) on every
+                                   # request; without a cap that alone pushes every
+                                   # turn past fast's window. null = trust client.
+
+  # Optional difficulty classification before routing: plain auto requests are
+  # judged once per user message by the configured tier ("FAST"/"DEEP").
+  # Advisory — any failure falls back to normal auto policy (PRD §20 opt-in).
+  complexity:
+    enabled: true
+    tier: fast                     # which backend judges (the cheap one)
+    timeout_seconds: 10            # per judge call; expiry -> auto policy
+    max_input_chars: 2000          # user message truncated to this before judging
+    cache_size: 256                # LRU of (session, message-hash) verdicts
+    disable_thinking: true         # send enable_thinking=false (Qwen3 llama.cpp)
 
   escalation:
     enabled: true
