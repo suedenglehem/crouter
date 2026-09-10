@@ -175,7 +175,10 @@ Chain: `fast → deep → frontier` (configurable). Failure counters reset when 
 
 **Queried context sizes (PRD §52).** A manual `max_context` can go stale when the server is restarted with different arguments. Set `query_context_size: true` on a backend and the router asks it at startup for its real window — llama-server reports the effective `--ctx-size` via `GET /props` (`default_generation_settings.n_ctx`) — and uses that value instead of the config one (logged as `using queried context size N`). Backends without `/props` or failed queries keep the manual value.
 
-**Runtime steering.** The bounds can also be changed on a live router, no restart needed:
+**Steering a live router.** Three mechanisms, lightest first — and in priority order, heaviest wins (pin > prompt markers > headers/model names):
+
+- **Prompt markers** — append `@@fast`, `@@deep` or `@@frontier` to a message; just that message's requests go to the named tier and the next message reverts to automatic routing. No endpoint, no state — in Claude Code one marker covers the whole agentic turn (details in the Prompt markers note above).
+- **Context bounds** (`/ctxlen`) — change a tier's effective window at runtime, no restart needed:
 
 ```bash
 curl -s http://127.0.0.1:8000/ctxlen/fast=32000    # fast's bound -> 32000 tokens
@@ -183,9 +186,9 @@ curl -s http://127.0.0.1:8000/ctxlen/deep=reset    # deep back to its startup va
 curl -s http://127.0.0.1:8000/ctxlen               # show current + initial bounds per tier
 ```
 
-The context floor reads the bound live on every request, so a change applies from the very next routed request. `reset` restores the *effective startup* value — the config value, or the queried size when `query_context_size` overrode it at boot. Changes are in-memory only: restarting the router reverts to the configuration file. Unknown tier → 404, bad value (`abc`, `0`, `-5`) → 400; a successful call returns `{"tier", "max_context", "previous_max_context"}`. This is what Claude Code hooks/slash commands use to steer routing mid-session (see [`integrations/claude_code`](integrations/claude_code/README.md)).
+- **Pin** (`/route/all/<tier>`) — the authoritative switch: *all* traffic goes to one tier at its maximum known window until you get back out with `/route/reset` (defaults) or `/route/last` (pre-pin bounds).
 
-For the stronger switch — pinning *all* traffic to one tier at its maximum window, with `reset`/`last` to get back out — see the `/route` endpoints above (`GET /route/all/<tier>`, `/route/reset`, `/route/last`).
+The context floor reads the bound live on every request, so a change applies from the very next routed request. `reset` restores the *effective startup* value — the config value, or the queried size when `query_context_size` overrode it at boot. Changes are in-memory only: restarting the router reverts to the configuration file. Unknown tier → 404, bad value (`abc`, `0`, `-5`) → 400; a successful call returns `{"tier", "max_context", "previous_max_context"}`. This is what Claude Code hooks/slash commands use to steer routing mid-session (see [`integrations/claude_code`](integrations/claude_code/README.md)).
 
 **Backend failure ≠ model failure.** A crashed llama-server (connection refused, 5xx, timeout) does *not* mean "the model was too weak". Backend failures go through the configured **fallback policy** (`routing.fallbacks`) and do not change task state — unless you explicitly enable the `timeout`/`backend_error` signals.
 
