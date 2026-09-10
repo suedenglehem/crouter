@@ -19,9 +19,12 @@ It sits between your agent and three model tiers — a fast local model, a stron
              ▼                ▼                 ▼
         LOCAL FAST       LOCAL DEEP        OPENROUTER (frontier)
         :8001            :8002              HTTPS
+          ▲
+          └── opt-in: the fast model also judges task complexity — one FAST/DEEP
+              verdict per new user message (cached), feeding automatic routing
 ```
 
-Design goals: **simple enough to understand and debug**, deterministic escalation (no LLM judging difficulty), transparent proxying (no prompt rewriting), and hard cloud-cost safeguards. See the PRD, *Local LLM Routing & Escalation System*, for the full specification; this README is the operator's guide.
+Design goals: **simple enough to understand and debug**, deterministic escalation (no LLM judging difficulty by default — an opt-in fast-model complexity verdict is available), transparent proxying (no prompt rewriting), and hard cloud-cost safeguards. See the PRD, *Local LLM Routing & Escalation System*, for the full specification; this README is the operator's guide.
 
 ---
 
