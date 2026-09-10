@@ -1,6 +1,6 @@
 # crouter — local LLM routing & escalation for Claude Code
 
-Operator guide for running the router on this machine. Full specification: [`prd/Local LLM Routing & Escalation System.md`](prd/Local%20LLM%20Routing%20%26%20Escalation%20System.md). Service code and its own docs: [`llm-router/README.md`](llm-router/README.md).
+Operator guide for running the router on this machine. Full specification: [`prd/Local LLM Routing & Escalation System.md`](prd/Local%20LLM%20Routing%20%26%20Escalation%20System.md). Service code and its own docs: [`llm-router/README.md`](llm-router/README.md). Deep dive on how the router actually works — every component, decision rule and config key, plus future-extension ideas: [`doc/README.md`](doc/README.md).
 
 ```text
                  Claude Code (/usr/local/bin/cl) / any OpenAI client
