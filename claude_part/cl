@@ -1,7 +1,6 @@
 #!/bin/sh
 
-nl=`ps aux | grep llm-router | wc -l`
-[ $nl -eq 0 ] && echo start llm-router && exit 1
+chk_llm_router=1
 
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
 export ANTHROPIC_API_KEY=local
@@ -13,7 +12,13 @@ export ANTHROPIC_API_KEY=local
 # time = 87k input + 80k max_output = 167k < deep ctx (172.8k). Turns whose
 # estimated size exceeds fast's ctx are bumped to deep by the router floor.
 
-export CLAUDE_CODE_MAX_OUTPUT_TOKENS=80000
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS=120000
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=140000
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536
+
+if [ $chk_llm_router -ne 0 ]
+then
+  nl=`ps aux | grep llm-router | wc -l`
+  [ $nl -eq 0 ] && echo start llm-router && exit 1
+fi
 
 $HOME/.local/bin/claude --model auto $@
