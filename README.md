@@ -1,6 +1,6 @@
 # crouter — local LLM routing & escalation for Claude Code
 
-Operator guide for running the router on this machine. Full specification: [`prd/Local LLM Routing & Escalation System.md`](prd/Local%20LLM%20Routing%20%26%20Escalation%20System.md). Service code and its own docs: [`llm-router/README.md`](llm-router/README.md). Deep dive on how the router actually works — every component, decision rule and config key, plus future-extension ideas: [`doc/README.md`](doc/README.md).
+Service code and its own docs: [`llm-router/README.md`](llm-router/README.md). Deep dive on how the router actually works — every component, decision rule and config key, plus future-extension ideas: [`doc/README.md`](doc/README.md).
 
 ```text
                  Claude Code (/usr/local/bin/cl) / any OpenAI client
@@ -31,8 +31,8 @@ Operator guide for running the router on this machine. Full specification: [`prd
 
 Both llama-servers must already be running (the router does not manage model lifecycle):
 
-- **fast**: `:8081` — Qwen3.5-9B-Claude-HighIQ, started by `/dd2/llama-server/qw9claude.sh`
-- **deep**: `i7:8080` (192.168.0.33) in the i7 config — Qwen3.8-27B-Uncensored; or local `:8080` via `/dd2/llama-server/qw_uncensored_mtp_q8_claude.sh`
+- **fast**: `:8081` — Qwen3.5-9B-Claude-HighIQ, started by `./llama_part/qw9claude.sh`
+- **deep**: `i7:8080` (192.168.0.33) in the i7 config — Qwen3.8-27B-Uncensored; or local `:8080` via `./llama_part/qw_uncensored_mtp_q8_claude.sh`
 
 ## Running
 
@@ -72,7 +72,7 @@ curl -s http://127.0.0.1:8000/v1/models                        # auto, local-fas
 fast and deep are always probed; frontier is probed only when `cloud.enabled: true` in that config (otherwise reported as SKIP). Both local models are thinking models, so the probe counts *any* generated token (`content` or `reasoning_content`) as a live answer. Exit codes: 0 = all enabled backends answered, 1 = at least one failed, 2 = bad config. A healthy run:
 
 ```text
-llms-ready — config /dd2/andrei/crouter/llm-router/config.yaml
+llms-ready — config ./llm-router/config.yaml
   fast     OK   http://127.0.0.1:8081/v1  257 ms  thinking only
   deep     OK   http://127.0.0.1:8080/v1  3002 ms  thinking only
   frontier SKIP   cloud disabled (cloud.enabled=false)
@@ -133,8 +133,8 @@ exec $HOME/.local/bin/claude --model auto "$@"
 ### 2. Steering slash commands (recommended)
 
 ```bash
-cp /dd2/andrei/crouter/llm-router/integrations/claude_code/ctxlen.md ~/.claude/commands/
-cp /dd2/andrei/crouter/llm-router/integrations/claude_code/route.md  ~/.claude/commands/
+cp ./llm-router/integrations/claude_code/ctxlen.md ~/.claude/commands/
+cp ./llm-router/integrations/claude_code/route.md  ~/.claude/commands/
 ```
 
 User-level (`~/.claude/commands/`) works from any project; use a project's `.claude/commands/` instead for per-project installs. Then, mid-session: `/ctxlen fast 32000`, `/route all deep`, `/route reset`, … (see the sections below for what each does).
@@ -146,7 +146,7 @@ The router's deterministic escalation (repeated test/tool failures → deeper ti
 ```bash
 # start from this file — it contains PostToolUse/Stop event hooks + a SessionStart
 # ctxlen auto-reset, with paths to fix up:
-less /dd2/andrei/crouter/llm-router/integrations/claude_code/hooks/settings.example.json
+less ./llm-router/integrations/claude_code/hooks/settings.example.json
 ```
 
 The hook scripts live in `llm-router/integrations/claude_code/hooks/` and forward signals (`test_failure`, `tool_failure`, `task_complete`) to the router's `/events`. Set `LLM_ROUTER_SESSION_ID` (in your shell profile or Claude Code's `env`) so events land on the right session.
