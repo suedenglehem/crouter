@@ -1,4 +1,5 @@
 # crouter — local LLM routing & escalation for Claude Code
+I have a threadripper box with 2 rtx 3090 and one 3080ti (couldn't get a third 3090 yet), qwen3.8 27b is just fine for vibe coding and i could run it at full context on 2 3090. 3080ti was sitting kinda idle. found that qwen 3.5 9b was fine for simple tasks and 12gb of 3080 are perfect for it. so, the idea was to max out machine, running 2 models and somehow switching b/w them on the fly in claude (or cline etc). acutally, i'm surprised it's not yet done in all harnesses, it should be.
 
 Service code and its own docs: [`llm-router/README.md`](llm-router/README.md). Deep dive on how the router actually works — every component, decision rule and config key, plus future-extension ideas: [`doc/README.md`](doc/README.md).
 
